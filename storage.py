@@ -63,22 +63,29 @@ class Storage:
         self.historial_file = Path(historial_file)
         self.verif_dir = Path(verif_dir)
         self._lock = asyncio.Lock()
-        self.historial: dict = {"por_huella": {}, "por_archivo": {}, "actualizado": None}
+        self.historial: dict = {"por_huella": {}, "por_archivo": {},
+                                "por_mensaje": {}, "actualizado": None}
 
     # ------------------------------------------------------------ historial
     async def cargar(self) -> None:
         data = await asyncio.to_thread(
             _leer_json, self.historial_file,
-            {"por_huella": {}, "por_archivo": {}, "actualizado": None},
+            {"por_huella": {}, "por_archivo": {}, "por_mensaje": {}, "actualizado": None},
         )
         data.setdefault("por_huella", {})
         data.setdefault("por_archivo", {})
+        data.setdefault("por_mensaje", {})
         self.historial = data
-        log.info("Historial cargado: %d comprobantes únicos", len(data["por_huella"]))
+        log.info("Historial cargado: %d comprobantes únicos, %d mensajes",
+                 len(data["por_huella"]), len(data["por_mensaje"]))
 
     async def _flush(self) -> None:
         self.historial["actualizado"] = _ahora()
         await asyncio.to_thread(_escribir_json, self.historial_file, self.historial)
+
+    def buscar_mensaje(self, chat_id, msg_id) -> dict | None:
+        """¿Este mensaje exacto ya fue leído alguna vez? (evita descarga + API)."""
+        return self.historial.get("por_mensaje", {}).get(f"{chat_id}:{msg_id}")
 
     def buscar_previo(self, huella: str | None, hash_img: str | None) -> dict | None:
         """Devuelve el registro original si este comprobante ya se procesó antes."""
@@ -116,6 +123,10 @@ class Storage:
             if ha and ha not in self.historial["por_archivo"]:
                 self.historial["por_archivo"][ha] = resumen
                 cambio = True
+            clave_msg = f"{item.get('chat_id')}:{item.get('msg_id')}"
+            if item.get("msg_id") and clave_msg not in self.historial.setdefault("por_mensaje", {}):
+                self.historial["por_mensaje"][clave_msg] = resumen
+                cambio = True
             if cambio:
                 await self._flush()
 
@@ -123,6 +134,7 @@ class Storage:
         return {
             "comprobantes": len(self.historial.get("por_huella", {})),
             "imagenes": len(self.historial.get("por_archivo", {})),
+            "mensajes": len(self.historial.get("por_mensaje", {})),
             "actualizado": self.historial.get("actualizado"),
         }
 
