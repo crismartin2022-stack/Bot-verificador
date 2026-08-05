@@ -354,10 +354,37 @@ class Bot:
         hash_img = utils.hash_archivo(data)
         item["hash_archivo"] = hash_img
 
-        # ¿Imagen idéntica ya procesada antes? No hace falta gastar una llamada.
+        # ¿Ya procesado antes? No hace falta gastar otra llamada a Claude.
         async with self.lock_dup:
             previo = self.storage.buscar_previo(None, hash_img)
         if previo:
+            mismo_mensaje = (previo.get("chat_id") == ctx["chat_id"]
+                             and previo.get("msg_id") == msg.id)
+            if mismo_mensaje:
+                # Es LA MISMA publicación releída (p. ej. una corrida cortada):
+                # se rehace el veredicto con lo ya leído, sin pagar de nuevo.
+                datos = {
+                    "es_comprobante": True,
+                    "monto_num": previo.get("monto"),
+                    "nombre_destino": previo.get("nombre") or "",
+                    "banco": previo.get("banco") or "",
+                    "nro_operacion": previo.get("nro_operacion") or "",
+                    "fecha": previo.get("fecha_comp") or "",
+                    "confianza": previo.get("confianza") if previo.get("confianza") is not None else 1.0,
+                }
+                item.update(
+                    nombre_img=datos["nombre_destino"], monto_img=datos["monto_num"],
+                    banco=datos["banco"], nro_operacion=datos["nro_operacion"],
+                    fecha_comp=datos["fecha"], confianza=datos["confianza"],
+                    huella=utils.huella_comprobante(datos), reusado=True,
+                )
+                veredicto = an.comparar(datos, nombre_pie, monto_pie)
+                item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
+                            sim_nombre=veredicto["sim_nombre"])
+                estado["reusados"] = estado.get("reusados", 0) + 1
+                estado["procesados"] += 1
+                return item
+
             item.update(
                 estado="duplicado",
                 detalle=(f"misma imagen ya registrada el {previo.get('fecha_msg', '?')} "
@@ -401,7 +428,7 @@ class Bot:
         return item
 
     async def verificar(self, event, chat_id: int, desde, hasta):
-        estado = {"mensajes": 0, "detectados": 0, "procesados": 0}
+        estado = {"mensajes": 0, "detectados": 0, "procesados": 0, "reusados": 0}
         self.progreso[chat_id] = estado
         aviso = None
         tareas: list[asyncio.Task] = []
@@ -431,6 +458,7 @@ class Bot:
                 "desde": desde.isoformat() if desde else None,
                 "hasta": hasta.isoformat() if hasta else None,
                 "mensajes": estado["mensajes"],
+                "reusados": estado.get("reusados", 0),
                 "fin": datetime.now(config.TZ).strftime("%d/%m/%Y %H:%M"),
                 "items": items,
             }
@@ -492,6 +520,8 @@ class Bot:
             f"🚫 No son comprobantes: **{c.get('no_comprobante', 0)}**",
             "",
             f"💰 Total válido: **{utils.fmt_monto(total_ok)}**",
+            (f"♻️ Reusados del historial (sin costo de API): **{resultado.get('reusados', 0)}**"
+             if resultado.get("reusados") else ""),
         ]
         problemas = [it for it in items if it["estado"] not in ("ok",)]
         if problemas:
