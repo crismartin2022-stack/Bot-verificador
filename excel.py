@@ -1,6 +1,7 @@
 """Lectura del Excel del admin y cruce contra lo verificado en el chat."""
 from __future__ import annotations
 
+import re
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -320,3 +321,103 @@ def generar_reporte_verificacion(items: list[dict], meta: dict, destino: Path) -
     destino.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(destino))
     return destino
+
+
+# ------------------------------------------------- importar reporte propio
+CABECERAS_VERIF = ("Estado", "Nombre (imagen)", "Monto (imagen)", "Nombre (pie)",
+                   "Monto (pie)", "Detalle", "Fecha msg", "Mensaje")
+
+
+def es_reporte_verificacion(path: str | Path) -> bool:
+    """True si el .xlsx es una planilla generada por este bot (no un Excel de cruce)."""
+    try:
+        wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    except Exception:
+        return False
+    try:
+        if "Comprobantes" not in wb.sheetnames:
+            return False
+        ws = wb["Comprobantes"]
+        fila = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        titulos = {str(c).strip() for c in fila if c}
+        return len(titulos & set(CABECERAS_VERIF)) >= 5
+    finally:
+        wb.close()
+
+
+def importar_verificacion(path: str | Path) -> tuple[dict, list[dict]]:
+    """Reconstruye (meta, items) desde una planilla de verificación del bot."""
+    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    try:
+        meta: dict = {}
+        if "Resumen" in wb.sheetnames:
+            for fila in wb["Resumen"].iter_rows(values_only=True):
+                if fila and fila[0]:
+                    meta[str(fila[0]).strip()] = fila[1] if len(fila) > 1 else None
+
+        ws = wb["Comprobantes"]
+        filas = ws.iter_rows(values_only=True)
+        cab = [str(c).strip() if c is not None else "" for c in next(filas, ())]
+        idx = {n: i for i, n in enumerate(cab)}
+
+        def val(fila, nombre):
+            i = idx.get(nombre)
+            if i is None or i >= len(fila):
+                return None
+            return fila[i]
+
+        try:
+            chat_id = int(str(meta.get("Chat ID") or 0))
+        except (TypeError, ValueError):
+            chat_id = 0
+        chat = str(meta.get("Chat") or "")
+
+        items: list[dict] = []
+        for fila in filas:
+            if not fila or not any(fila):
+                continue
+            link = str(val(fila, "Mensaje") or "")
+            m = re.search(r"/(\d+)\s*$", link)
+            msg_id = int(m.group(1)) if m else None
+            if not chat_id:
+                m2 = re.search(r"/c/(\d+)/", link)
+                if m2:
+                    chat_id = int(f"-100{m2.group(1)}")
+
+            datos = {
+                "monto": val(fila, "Monto (imagen)"),
+                "fecha": val(fila, "Fecha comprobante"),
+                "nombre_destino": val(fila, "Nombre (imagen)"),
+                "nro_operacion": val(fila, "N° operación"),
+                "banco": val(fila, "Banco"),
+            }
+            items.append({
+                "chat_id": chat_id,
+                "chat": chat,
+                "msg_id": msg_id,
+                "fecha_msg": str(val(fila, "Fecha msg") or ""),
+                "remitente": str(val(fila, "Remitente") or ""),
+                "nombre_img": str(val(fila, "Nombre (imagen)") or ""),
+                "monto_img": utils.parse_monto(val(fila, "Monto (imagen)")),
+                "nombre_pie": str(val(fila, "Nombre (pie)") or ""),
+                "monto_pie": utils.parse_monto(val(fila, "Monto (pie)")),
+                "banco": str(val(fila, "Banco") or ""),
+                "nro_operacion": str(val(fila, "N° operación") or ""),
+                "fecha_comp": str(val(fila, "Fecha comprobante") or ""),
+                "estado": str(val(fila, "Estado") or "").strip(),
+                "detalle": str(val(fila, "Detalle") or ""),
+                "link": link,
+                "huella": utils.huella_comprobante(datos),
+                "importado": True,
+            })
+
+        meta_out = {
+            "chat_id": chat_id,
+            "chat": chat,
+            "mensajes": meta.get("Mensajes leídos") or 0,
+            "desde": meta.get("Desde"),
+            "hasta": meta.get("Hasta"),
+        }
+        return meta_out, items
+    finally:
+        wb.close()
