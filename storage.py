@@ -100,6 +100,11 @@ class Storage:
             "monto": item.get("monto_img") if item.get("monto_img") is not None else item.get("monto_pie"),
             "nro_operacion": item.get("nro_operacion"),
             "link": item.get("link"),
+            # Datos de la lectura, para poder rehacer la comparación sin volver
+            # a pagar una llamada a Claude si se re-verifica el mismo mensaje.
+            "banco": item.get("banco"),
+            "fecha_comp": item.get("fecha_comp"),
+            "confianza": item.get("confianza"),
             "registrado": _ahora(),
         }
         async with self._lock:
