@@ -7,7 +7,11 @@ Comandos (desde tu propia cuenta o desde un ADMIN_ID):
   /estado                                estado del bot y del historial
   /cancelar [CHAT_ID]                    corta una verificación en curso
   /ayuda                                 esta ayuda
-  (mandar un .xlsx al privado)           cruza el Excel contra lo verificado
+
+Cruce con Excel: mandá el .xlsx al privado. En el pie del archivo podés poner:
+  (nada)                 cruza contra TODOS los grupos verificados, todas las hojas
+  /excel 30-7            todos los grupos, solo la hoja «30-7»
+  /excel -100123 30-7    solo ese grupo, solo esa hoja
 """
 from __future__ import annotations
 
@@ -137,8 +141,10 @@ class Bot:
             elif cmd == "cancelar":
                 await self.cmd_cancelar(event, resto)
             elif cmd == "excel":
-                await event.respond("Adjuntá el archivo .xlsx a este mensaje "
-                                    "(o mandalo con el pie `/excel CHAT_ID`).")
+                await event.respond(
+                    "Adjuntá el .xlsx a este mensaje.\n"
+                    "Sin pie: cruza contra todos los grupos verificados.\n"
+                    "`/excel 30-7` limita a esa hoja · `/excel -100123 30-7` a un grupo y hoja.")
         except FloodWaitError as e:
             log.warning("FloodWait %ss", e.seconds)
             await asyncio.sleep(min(e.seconds, 60))
@@ -528,42 +534,63 @@ class Bot:
         if not nombre.lower().endswith((".xlsx", ".xlsm")):
             return
 
+        # Sin IDs en el pie: cruza contra TODOS los grupos verificados.
+        # Con IDs: solo contra esos. Cualquier otra palabra = nombre de hoja.
         pie = (event.raw_text or "").strip()
-        chat_id = self.ultima_verif
-        m = re.search(r"(-?\d{6,})", pie)
-        if m:
-            chat_id = int(m.group(1))
-        if chat_id is None:
+        ids = [int(x) for x in re.findall(r"-?\d{6,}", pie)]
+        resto = re.sub(r"-?\d{6,}", " ", pie)
+        resto = re.sub(r"(?i)^\s*/excel\b", " ", resto)
+        hojas = [t for t in re.split(r"[\s,]+", resto) if t and not t.startswith("/")]
+        if not ids:
+            ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
+        if not ids:
             await event.respond("No tengo ninguna verificación guardada todavía. "
                                 "Corré `/verificar CHAT_ID` primero.")
             return
 
-        verif = await self.storage.cargar_verificacion(chat_id)
-        if not verif:
-            await event.respond(f"No hay verificación guardada para `{chat_id}`. "
-                                f"Corré `/verificar {chat_id}` primero.")
+        verifs = []
+        for cid in ids:
+            v = await self.storage.cargar_verificacion(cid)
+            if v:
+                verifs.append(v)
+        if not verifs:
+            await event.respond("No encontré verificaciones guardadas para esos IDs.")
             return
 
-        aviso = await event.respond(f"📥 Leyendo `{nombre}` y cruzando contra **{verif.get('chat')}**…")
+        items, grupos = [], []
+        for v in verifs:
+            etiqueta = v.get("chat") or str(v.get("chat_id"))
+            grupos.append(etiqueta)
+            for it in v.get("items", []):
+                it.setdefault("chat", etiqueta)
+                it.setdefault("chat_id", v.get("chat_id"))
+                items.append(it)
+
+        chat_id = verifs[0].get("chat_id")
+        aviso = await event.respond(
+            f"📥 Leyendo `{nombre}` y cruzando contra **{len(verifs)}** grupo(s): "
+            + ", ".join(grupos) + "…")
         tmp = Path("/tmp") / f"admin_{event.id}.xlsx"
         try:
             await event.download_media(file=str(tmp))
-            filas, desc = await asyncio.to_thread(xl.leer_excel, tmp)
+            filas, desc = await asyncio.to_thread(xl.leer_excel, tmp, hojas)
             if not filas:
-                await aviso.edit("El Excel no tiene filas con nombre y monto reconocibles.\n"
-                                 "Poné encabezados tipo `Nombre` y `Monto`.")
+                await aviso.edit(f"No pude leer filas del Excel.\n_{desc}_\n\n"
+                                 "Necesito una columna de nombre (Nombre/Titular/Cliente) "
+                                 "y una de monto (Monto/Importe/Pago).")
                 return
-            res = await asyncio.to_thread(xl.cruzar, verif["items"], filas)
-            ruta = config.REPORTES_DIR / f"cruce_{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            res = await asyncio.to_thread(xl.cruzar, items, filas)
+            ruta = config.REPORTES_DIR / f"cruce_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
             await asyncio.to_thread(
                 xl.generar_reporte, res,
-                {"chat": verif.get("chat"), "chat_id": chat_id, "archivo": nombre}, ruta,
+                {"chat": ", ".join(grupos), "chat_id": chat_id,
+                 "archivo": nombre, "grupos": grupos}, ruta,
             )
 
             lineas = [
                 f"📊 **Cruce con `{nombre}`**",
                 f"_{desc}_",
-                f"Chat: **{verif.get('chat')}** (`{chat_id}`)",
+                f"Grupos: **{len(grupos)}** — " + ", ".join(grupos),
                 "",
                 f"✅ Coinciden: **{len(res['coinciden'])}**",
                 f"🔁 Duplicados / reenviados: **{len(res['duplicados'])}**",
@@ -582,7 +609,8 @@ class Bot:
                 lineas.append("\n**⚠️ En el chat sin respaldo en el Excel:**")
                 for it in res["solo_chat"][:25]:
                     n, mo = xl._datos_item(it)
-                    lineas.append(f"• {n or '?'} — {utils.fmt_monto(mo)} · {it.get('fecha_msg', '')} {it.get('link', '')}")
+                    lineas.append(f"• [{it.get('chat', '')}] {n or '?'} — {utils.fmt_monto(mo)} · "
+                                  f"{it.get('fecha_msg', '')} {it.get('link', '')}")
                 if len(res["solo_chat"]) > 25:
                     lineas.append(f"… y {len(res['solo_chat']) - 25} más.")
 
