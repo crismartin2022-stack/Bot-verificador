@@ -18,6 +18,8 @@ CLAVES_NOMBRE = ("nombre", "apellido", "titular", "cliente", "beneficiario",
                  "destinatario", "socio", "alumno", "persona", "paciente")
 CLAVES_MONTO = ("monto", "importe", "valor", "pago", "total", "abono", "deposito", "depósito")
 CLAVES_FECHA = ("fecha", "dia", "día")
+ENCABEZADOS_RUIDO = {"NOMBRE", "MONTO", "IMPORTE", "TITULAR", "CLIENTE", "FECHA", "TOTAL",
+                     "APELLIDO", "NOMBRE Y APELLIDO", "BENEFICIARIO", "DESTINATARIO"}
 
 
 def _detectar_columnas(hoja, max_filas: int = 15) -> tuple[int, dict]:
@@ -43,44 +45,72 @@ def _detectar_columnas(hoja, max_filas: int = 15) -> tuple[int, dict]:
     return 0, {"nombre": 1, "monto": 2}
 
 
-def leer_excel(path: str | Path) -> tuple[list[dict], str]:
-    """Devuelve (filas, descripción de cómo se interpretó el archivo)."""
+def leer_excel(path: str | Path, hojas: list[str] | None = None) -> tuple[list[dict], str]:
+    """Lee las hojas del libro (todas, o solo las de `hojas`).
+
+    Devuelve (filas, cómo se interpretó).
+    """
     wb = load_workbook(filename=str(path), data_only=True, read_only=True)
-    hoja = wb.active
-    fila_enc, cols = _detectar_columnas(hoja)
     filas: list[dict] = []
-    inicio = fila_enc + 1 if fila_enc else 1
+    detalles: list[str] = []
+    ignoradas: list[str] = []
 
-    for i, fila in enumerate(hoja.iter_rows(min_row=inicio, values_only=True), start=inicio):
-        def celda(clave):
-            idx = cols.get(clave)
-            if not idx or idx > len(fila):
-                return None
-            return fila[idx - 1]
+    pedidas = [utils.normalizar(h) for h in (hojas or []) if h]
+    seleccionadas = wb.worksheets
+    if pedidas:
+        seleccionadas = [h for h in wb.worksheets if utils.normalizar(h.title) in pedidas]
+        if not seleccionadas:
+            disponibles = ", ".join(h.title for h in wb.worksheets)
+            wb.close()
+            return [], f"no encontré esa(s) hoja(s). Disponibles: {disponibles}"
 
-        nombre_raw = celda("nombre")
-        monto_raw = celda("monto")
-        if nombre_raw is None and monto_raw is None:
-            continue
-        nombre = str(nombre_raw).strip() if nombre_raw is not None else ""
-        monto = utils.parse_monto(monto_raw)
-        if not utils.tokens_nombre(nombre) and monto is None:
-            continue
-        fecha = celda("fecha")
-        if isinstance(fecha, datetime):
-            fecha = fecha.date().isoformat()
-        filas.append({
-            "fila": i,
-            "nombre": nombre,
-            "monto": monto,
-            "fecha": str(fecha) if fecha else "",
-        })
+    for hoja in seleccionadas:
+        fila_enc, cols = _detectar_columnas(hoja)
+        if not fila_enc and hoja.max_row and hoja.max_row > 2:
+            # Sin encabezado reconocible: solo se asume A/B si es la única hoja
+            if len(seleccionadas) > 1:
+                ignoradas.append(hoja.title)
+                continue
+
+        n_antes = len(filas)
+        inicio = fila_enc + 1 if fila_enc else 1
+
+        for i, fila in enumerate(hoja.iter_rows(min_row=inicio, values_only=True), start=inicio):
+            def celda(clave):
+                idx = cols.get(clave)
+                if not idx or idx > len(fila):
+                    return None
+                return fila[idx - 1]
+
+            nombre_raw = celda("nombre")
+            monto_raw = celda("monto")
+            if nombre_raw is None and monto_raw is None:
+                continue
+            nombre = str(nombre_raw).strip() if nombre_raw is not None else ""
+            if utils.normalizar(nombre) in ENCABEZADOS_RUIDO:
+                continue  # encabezado repetido en medio de la hoja
+            monto = utils.parse_monto(monto_raw)
+            if not utils.tokens_nombre(nombre) and monto is None:
+                continue
+            fecha = celda("fecha")
+            if isinstance(fecha, datetime):
+                fecha = fecha.date().isoformat()
+            filas.append({
+                "hoja": hoja.title,
+                "fila": i,
+                "nombre": nombre,
+                "monto": monto,
+                "fecha": str(fecha) if fecha else "",
+            })
+
+        if len(filas) > n_antes:
+            detalles.append(f"«{hoja.title}» {len(filas) - n_antes} filas "
+                            f"({get_column_letter(cols['nombre'])}/{get_column_letter(cols['monto'])})")
     wb.close()
 
-    desc = (f"hoja «{hoja.title}», columnas: "
-            f"nombre={get_column_letter(cols['nombre'])}, monto={get_column_letter(cols['monto'])}"
-            + (f", fecha={get_column_letter(cols['fecha'])}" if cols.get("fecha") else "")
-            + (f" (encabezado en fila {fila_enc})" if fila_enc else " (sin encabezado detectado)"))
+    desc = f"{len(filas)} filas de {len(detalles)} hoja(s): " + "; ".join(detalles)
+    if ignoradas:
+        desc += " · sin encabezado reconocible: " + ", ".join(ignoradas)
     return filas, desc
 
 
@@ -100,21 +130,29 @@ def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
         if it.get("estado") not in ("no_comprobante", "sin_pie")
     ]
 
-    # Duplicados: marcados durante la verificación o repetidos dentro del mismo lote
+    # Duplicados: marcados durante la verificación, o repetidos dentro del lote
+    # (incluye el mismo comprobante mandado a DOS grupos distintos).
     duplicados = [it for it in candidatos if it.get("estado") == "duplicado"]
+    ids_dup = {id(it) for it in duplicados}
     vistos: dict[str, dict] = {}
     for it in candidatos:
-        h = it.get("huella")
-        if not h or it.get("estado") == "duplicado":
+        if it.get("estado") == "duplicado":
             continue
-        if h in vistos:
-            it = dict(it)
-            it["dup_de"] = vistos[h].get("msg_id")
-            duplicados.append(it)
+        claves = [k for k in (it.get("huella"), it.get("hash_archivo")) if k]
+        if not claves:
+            continue
+        previo = next((vistos[k] for k in claves if k in vistos), None)
+        if previo is not None:
+            copia = dict(it)
+            copia["dup_de"] = previo.get("msg_id")
+            copia["dup_detalle"] = (f"ya contado en {previo.get('chat') or previo.get('chat_id')} "
+                                    f"({previo.get('fecha_msg', '')})")
+            duplicados.append(copia)
+            ids_dup.add(id(it))       # el original queda fuera de los faltantes
         else:
-            vistos[h] = it
+            for k in claves:
+                vistos[k] = it
 
-    ids_dup = {id(x) for x in duplicados}
     disponibles = [it for it in candidatos if id(it) not in ids_dup]
     usados: set[int] = set()
 
@@ -200,29 +238,40 @@ def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
     ]
     for k, v in filas_res:
         resumen.append([k, v])
+
+    if meta.get("grupos"):
+        resumen.append(["", ""])
+        resumen.append(["Grupos incluidos", ""])
+        por_grupo: dict[str, int] = {}
+        for s in res["solo_chat"]:
+            g = s.get("chat") or str(s.get("chat_id", ""))
+            por_grupo[g] = por_grupo.get(g, 0) + 1
+        for g in meta["grupos"]:
+            resumen.append([f"  {g}", f"{por_grupo.get(g, 0)} sin respaldo en el Excel"])
+
     for r in range(1, resumen.max_row + 1):
         resumen.cell(row=r, column=1).font = Font(bold=True)
     resumen.column_dimensions["A"].width = 34
     resumen.column_dimensions["B"].width = 40
 
     _hoja(wb, "✅ Coinciden",
-          ["Nombre (Excel)", "Monto (Excel)", "Fila", "Nombre (imagen)", "Monto (imagen)",
-           "Similitud", "Fecha msg", "Mensaje"],
+          ["Nombre (Excel)", "Monto (Excel)", "Fila", "Grupo", "Nombre (imagen)",
+           "Monto (imagen)", "Similitud", "Fecha msg", "Mensaje"],
           [[c["excel"]["nombre"], c["excel"]["monto"], c["excel"]["fila"],
-            _datos_item(c["chat"])[0], _datos_item(c["chat"])[1],
+            c["chat"].get("chat", ""), _datos_item(c["chat"])[0], _datos_item(c["chat"])[1],
             round(c["similitud"], 2), c["chat"].get("fecha_msg", ""), c["chat"].get("link", "")]
            for c in res["coinciden"]], "ok")
 
     _hoja(wb, "🔁 Duplicados",
-          ["Nombre", "Monto", "Fecha msg", "Remitente", "Original", "Mensaje"],
-          [[_datos_item(d)[0], _datos_item(d)[1], d.get("fecha_msg", ""), d.get("remitente", ""),
-            d.get("dup_detalle") or d.get("dup_de", ""), d.get("link", "")]
+          ["Grupo", "Nombre", "Monto", "Fecha msg", "Remitente", "Original", "Mensaje"],
+          [[d.get("chat", ""), _datos_item(d)[0], _datos_item(d)[1], d.get("fecha_msg", ""),
+            d.get("remitente", ""), d.get("dup_detalle") or d.get("dup_de", ""), d.get("link", "")]
            for d in res["duplicados"]], "dup")
 
     _hoja(wb, "⚠️ Solo en chat",
-          ["Nombre", "Monto", "Estado", "Detalle", "Fecha msg", "Remitente", "Mensaje"],
-          [[_datos_item(s)[0], _datos_item(s)[1], s.get("estado", ""), s.get("detalle", ""),
-            s.get("fecha_msg", ""), s.get("remitente", ""), s.get("link", "")]
+          ["Grupo", "Nombre", "Monto", "Estado", "Detalle", "Fecha msg", "Remitente", "Mensaje"],
+          [[s.get("chat", ""), _datos_item(s)[0], _datos_item(s)[1], s.get("estado", ""),
+            s.get("detalle", ""), s.get("fecha_msg", ""), s.get("remitente", ""), s.get("link", "")]
            for s in res["solo_chat"]], "chat")
 
     _hoja(wb, "❌ Solo en Excel",
