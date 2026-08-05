@@ -43,7 +43,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 RE_CMD = re.compile(
-    r"(?i)^/(grupos|verificar|reset|estado|cancelar|ayuda|start|excel)(?:@\w+)?\s*(.*)$",
+    r"(?i)^/(grupos|verificar|reset|estado|cancelar|ayuda|start|excel|importar)(?:@\w+)?\s*(.*)$",
     re.DOTALL,
 )
 
@@ -140,6 +140,10 @@ class Bot:
                 await self.cmd_estado(event)
             elif cmd == "cancelar":
                 await self.cmd_cancelar(event, resto)
+            elif cmd == "importar":
+                await event.respond(
+                    "Adjuntá una planilla `verificacion_*.xlsx` que te haya mandado el bot.\n"
+                    "La reimporta al historial sin volver a gastar API.")
             elif cmd == "excel":
                 await event.respond(
                     "Adjuntá el .xlsx a este mensaje.\n"
@@ -344,6 +348,32 @@ class Bot:
             "pie": pie, "nombre_pie": nombre_pie, "monto_pie": monto_pie,
             "link": link_mensaje(ctx["chat_id"], msg.id, ctx.get("username")),
         }
+
+        # ¿Este mensaje exacto ya se leyó alguna vez? Se rehace el veredicto
+        # con lo guardado: sin descarga y sin llamada a Claude.
+        previo_msg = self.storage.buscar_mensaje(ctx["chat_id"], msg.id)
+        if previo_msg and previo_msg.get("monto") is not None:
+            datos = {
+                "es_comprobante": True,
+                "monto_num": previo_msg.get("monto"),
+                "nombre_destino": previo_msg.get("nombre") or "",
+                "banco": previo_msg.get("banco") or "",
+                "nro_operacion": previo_msg.get("nro_operacion") or "",
+                "fecha": previo_msg.get("fecha_comp") or "",
+                "confianza": previo_msg.get("confianza") if previo_msg.get("confianza") is not None else 1.0,
+            }
+            item.update(
+                nombre_img=datos["nombre_destino"], monto_img=datos["monto_num"],
+                banco=datos["banco"], nro_operacion=datos["nro_operacion"],
+                fecha_comp=datos["fecha"], confianza=datos["confianza"],
+                huella=utils.huella_comprobante(datos), reusado=True,
+            )
+            veredicto = an.comparar(datos, nombre_pie, monto_pie)
+            item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
+                        sim_nombre=veredicto["sim_nombre"])
+            estado["reusados"] = estado.get("reusados", 0) + 1
+            estado["procesados"] += 1
+            return item
 
         data = await self.descargar(msg)
         if not data:
@@ -571,38 +601,47 @@ class Bot:
         resto = re.sub(r"-?\d{6,}", " ", pie)
         resto = re.sub(r"(?i)^\s*/excel\b", " ", resto)
         hojas = [t for t in re.split(r"[\s,]+", resto) if t and not t.startswith("/")]
-        if not ids:
-            ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
-        if not ids:
-            await event.respond("No tengo ninguna verificación guardada todavía. "
-                                "Corré `/verificar CHAT_ID` primero.")
-            return
-
-        verifs = []
-        for cid in ids:
-            v = await self.storage.cargar_verificacion(cid)
-            if v:
-                verifs.append(v)
-        if not verifs:
-            await event.respond("No encontré verificaciones guardadas para esos IDs.")
-            return
-
-        items, grupos = [], []
-        for v in verifs:
-            etiqueta = v.get("chat") or str(v.get("chat_id"))
-            grupos.append(etiqueta)
-            for it in v.get("items", []):
-                it.setdefault("chat", etiqueta)
-                it.setdefault("chat_id", v.get("chat_id"))
-                items.append(it)
-
-        chat_id = verifs[0].get("chat_id")
-        aviso = await event.respond(
-            f"📥 Leyendo `{nombre}` y cruzando contra **{len(verifs)}** grupo(s): "
-            + ", ".join(grupos) + "…")
         tmp = Path("/tmp") / f"admin_{event.id}.xlsx"
+        aviso = None
         try:
             await event.download_media(file=str(tmp))
+
+            # ¿Es una planilla generada por este bot? Entonces se IMPORTA
+            # (recupera la verificación sin repetir el gasto de API).
+            forzar_cruce = bool(re.match(r"(?i)\s*/excel\b", pie))
+            es_reporte = await asyncio.to_thread(xl.es_reporte_verificacion, tmp)
+            if not forzar_cruce and (es_reporte or re.match(r"(?i)\s*/importar\b", pie)):
+                await self.importar_planilla(event, tmp, nombre)
+                return
+
+            # A partir de acá: Excel de referencia para cruzar.
+            if not ids:
+                ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
+            verifs = []
+            for cid in ids:
+                v = await self.storage.cargar_verificacion(cid)
+                if v:
+                    verifs.append(v)
+            if not verifs:
+                await event.respond(
+                    "No tengo verificaciones guardadas para cruzar.\n"
+                    "Corré `/verificar CHAT_ID`, o mandame una planilla "
+                    "`verificacion_*.xlsx` para importarla.")
+                return
+
+            items, grupos = [], []
+            for v in verifs:
+                etiqueta = v.get("chat") or str(v.get("chat_id"))
+                grupos.append(etiqueta)
+                for it in v.get("items", []):
+                    it.setdefault("chat", etiqueta)
+                    it.setdefault("chat_id", v.get("chat_id"))
+                    items.append(it)
+            chat_id = verifs[0].get("chat_id")
+
+            aviso = await event.respond(
+                f"📥 Leyendo `{nombre}` y cruzando contra **{len(verifs)}** grupo(s): "
+                + ", ".join(grupos) + "…")
             filas, desc = await asyncio.to_thread(xl.leer_excel, tmp, hojas)
             if not filas:
                 await aviso.edit(f"No pude leer filas del Excel.\n_{desc}_\n\n"
@@ -652,6 +691,60 @@ class Bot:
             await event.respond(f"⚠️ No pude procesar el Excel: `{type(e).__name__}: {e}`")
         finally:
             tmp.unlink(missing_ok=True)
+
+    async def importar_planilla(self, event, tmp, nombre: str):
+        """Reconstruye una verificación desde una planilla del propio bot."""
+        aviso = await event.respond(f"♻️ Importando `{nombre}`…")
+        try:
+            meta, items = await asyncio.to_thread(xl.importar_verificacion, tmp)
+            if not items or not meta.get("chat_id"):
+                await aviso.edit("No pude leer la planilla: le falta la hoja «Comprobantes» "
+                                 "o el Chat ID en el «Resumen».")
+                return
+
+            nuevos = 0
+            for it in items:
+                if it.get("msg_id") and it.get("monto_img") is not None:
+                    antes = len(self.storage.historial.get("por_mensaje", {}))
+                    await self.storage.registrar(it)
+                    nuevos += len(self.storage.historial.get("por_mensaje", {})) - antes
+
+            chat_id = meta["chat_id"]
+            previa = await self.storage.cargar_verificacion(chat_id)
+            if previa:
+                por_msg = {i.get("msg_id"): i for i in previa.get("items", []) if i.get("msg_id")}
+                for it in items:
+                    por_msg.setdefault(it.get("msg_id"), it)
+                items = sorted(por_msg.values(), key=lambda x: x.get("msg_id") or 0)
+
+            await self.storage.guardar_verificacion(chat_id, {
+                "chat_id": chat_id,
+                "chat": meta.get("chat") or str(chat_id),
+                "desde": meta.get("desde"),
+                "hasta": meta.get("hasta"),
+                "mensajes": meta.get("mensajes") or 0,
+                "fin": datetime.now(config.TZ).strftime("%d/%m/%Y %H:%M"),
+                "items": items,
+                "importado_de": nombre,
+            })
+            self.ultima_verif = chat_id
+
+            conteo: dict[str, int] = {}
+            for it in items:
+                conteo[it.get("estado", "?")] = conteo.get(it.get("estado", "?"), 0) + 1
+            st = self.storage.stats_historial()
+
+            await aviso.edit(
+                f"♻️ **Importado**: {len(items)} comprobantes de "
+                f"**{meta.get('chat') or chat_id}** (`{chat_id}`)\n"
+                f"Nuevos en el historial: {nuevos}\n"
+                f"Estados: " + " · ".join(f"{k}: {v}" for k, v in sorted(conteo.items())) + "\n\n"
+                f"📚 Historial: {st['comprobantes']} comprobantes · {st.get('mensajes', 0)} mensajes\n"
+                "Ya podés mandarme el Excel de referencia para cruzarlo."
+            )
+        except Exception as e:
+            log.exception("Error importando planilla")
+            await event.respond(f"⚠️ No pude importar la planilla: `{type(e).__name__}: {e}`")
 
     # ----------------------------------------------------------------- helpers
     async def responder_largo(self, event, texto: str, limite: int = 3800):
