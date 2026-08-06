@@ -185,7 +185,8 @@ def leer_excel(path: str | Path, hojas: list[str] | None = None) -> tuple[list[d
 
 # ------------------------------------------------------------------- cruce
 def _datos_item(it: dict) -> tuple[str, float | None]:
-    nombre = it.get("nombre_img") or it.get("nombre_pie") or ""
+    nombre = (it.get("nombre_img") or it.get("nombre_pie")
+              or it.get("nombre_origen") or it.get("nombre_destino") or "")
     monto = it.get("monto_img")
     if monto is None:
         monto = it.get("monto_pie")
@@ -208,11 +209,23 @@ def _perfil(it: dict) -> dict:
     montos = [it.get("monto_img"), it.get("monto_pie")]
 
     pie = it.get("pie") or ""
+    if not pie and (it.get("nombre_pie") or it.get("monto_pie") is not None):
+        # Planillas importadas: se reconstruye el pie para releerlo bien
+        pie = f"{it.get('nombre_pie') or ''} {it.get('monto_pie') or ''}".strip()
     if pie:
         n_pie, m_pie, d_pie = utils.parse_pie(pie)
         nombres.append(n_pie)
         docs.append(d_pie)
         montos.append(m_pie)
+        # Un pie puede juntar varias personas: se toman todas por separado
+        if len(utils.tokens_nombre(n_pie)) > 5:
+            nombres.extend(utils.nombres_candidatos(pie))
+
+    # Un "monto" entero de 7-8 dígitos distinto al de la imagen suele ser el DNI
+    mp = it.get("monto_pie")
+    if mp is not None and float(mp).is_integer() and 1_000_000 <= mp <= 99_999_999:
+        if it.get("monto_img") is None or abs(mp - (it.get("monto_img") or 0)) > 0.01:
+            docs.append(str(int(mp)))
 
     perfil = {
         "opers": {utils.normalizar(o) for o in (it.get("nro_operacion"),) if o and len(str(o)) >= 6},
@@ -389,10 +402,18 @@ def _hoja_carga(wb, faltantes: list[dict], semana: str = ""):
         celda.fill = _FILL["chat"]
         celda.alignment = Alignment(horizontal="center")
 
-    for n, it in enumerate(faltantes, 1):
+    def _orden(it):
+        f = _fecha_item(_perfil(it)) or "9999-99-99"
+        return (f, str(it.get("hora_comp") or "99:99"), it.get("msg_id") or 0)
+
+    for n, it in enumerate(sorted(faltantes, key=_orden), 1):
         perfil = _perfil(it)
-        remitente = (it.get("nombre_origen") or it.get("nombre_pie")
-                     or it.get("nombre_img") or "")
+        # El remitente limpio: primero lo que leyó Claude; si no, el mejor
+        # nombre propio que se pueda sacar del pie.
+        remitente = it.get("nombre_origen") or ""
+        if not remitente:
+            cands = utils.nombres_candidatos(it.get("pie") or it.get("nombre_pie") or "")
+            remitente = cands[0] if cands else (it.get("nombre_pie") or it.get("nombre_img") or "")
         doc = it.get("cuit_origen") or it.get("doc_pie") or (sorted(perfil["docs"]) or [""])[0]
         notas = " · ".join(x for x in [
             f"Código de identificación: {it.get('nro_operacion')}" if it.get("nro_operacion") else "",
@@ -415,7 +436,8 @@ def _hoja_carga(wb, faltantes: list[dict], semana: str = ""):
             "Exitoso" if it.get("estado") == "ok" else (it.get("estado") or ""),
             "grupo",
             notas,
-            f'=HYPERLINK("{it.get("link", "")}","Ver imagen")' if it.get("link") else "",
+            (f'=HYPERLINK("{it.get("imagen_url") or it.get("link", "")}","Ver imagen")'
+             if (it.get("imagen_url") or it.get("link")) else ""),
         ])
 
     anchos = [5, 24, 18, 10, 22, 13, 12, 14, 14, 26, 16, 16, 12, 10, 45, 12]
@@ -440,6 +462,57 @@ def _hoja(wb, titulo, cabeceras, filas, color):
         ws.column_dimensions[get_column_letter(c)].width = min(max(largo + 2, 12), 45)
     ws.freeze_panes = "A2"
     return ws
+
+
+def _hoja_cobertura(wb, res: dict):
+    """Todos los comprobantes leídos, por grupo y por ID de mensaje.
+
+    Sirve para comparar contra otra herramienta y ver cuáles se salteó:
+    los IDs de Telegram son correlativos, así que un hueco se ve a simple vista.
+    """
+    ws = wb.create_sheet("🧾 Cobertura")
+    cab = ["Grupo", "ID mensaje", "Fecha msg", "Nombre", "Monto",
+           "¿Está en el Excel?", "Estado", "Imagen"]
+    ws.append(cab)
+    for c in range(1, len(cab) + 1):
+        celda = ws.cell(row=1, column=c)
+        celda.font = _CAB
+        celda.fill = _FILL["res"]
+        celda.alignment = Alignment(horizontal="center")
+
+    marcados = {id(c["chat"]) for c in res["coinciden"]}
+    filas = []
+    for grupo, etiqueta in ((res["coinciden"], None), (res["solo_chat"], "NO"),
+                            (res["duplicados"], "DUPLICADO")):
+        for x in grupo:
+            it = x["chat"] if isinstance(x, dict) and "chat" in x and "excel" in x else x
+            en_excel = "SÍ" if id(it) in marcados else (etiqueta or "NO")
+            filas.append([
+                it.get("chat", ""), it.get("msg_id"), it.get("fecha_msg", ""),
+                _datos_item(it)[0], _datos_item(it)[1], en_excel,
+                it.get("estado", ""),
+                (f'=HYPERLINK("{it.get("imagen_url") or it.get("link", "")}","Ver")'
+                 if (it.get("imagen_url") or it.get("link")) else ""),
+            ])
+    filas.sort(key=lambda f: (str(f[0]), f[1] or 0))
+    for f in filas:
+        ws.append(f)
+
+    for c, a in enumerate([26, 12, 18, 28, 14, 18, 14, 10], 1):
+        ws.column_dimensions[get_column_letter(c)].width = a
+    ws.freeze_panes = "A2"
+
+    # Resumen de rango por grupo, arriba del todo
+    rangos: dict[str, list] = {}
+    for f in filas:
+        r = rangos.setdefault(f[0], [f[1], f[1], 0, 0])
+        if f[1]:
+            r[0] = min(r[0] or f[1], f[1])
+            r[1] = max(r[1] or f[1], f[1])
+        r[2] += 1
+        if f[5] == "SÍ":
+            r[3] += 1
+    return rangos
 
 
 def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
@@ -510,9 +583,26 @@ def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
             s.get("archivo", ""), s.get("hoja", ""), s["fila"]] for s in res["solo_excel"]],
           "excel")
 
+    rangos = _hoja_cobertura(wb, res)
+    if rangos:
+        resumen.append(["", ""])
+        resumen.append(["Cobertura por grupo (ID de mensaje)", ""])
+        for g, (ini, fin, tot, ok) in rangos.items():
+            resumen.append([f"  {g}", f"IDs {ini}–{fin} · {tot} comprobantes · {ok} en el Excel"])
+
     if res["solo_chat"]:
         _hoja_carga(wb, res["solo_chat"], meta.get("semana", ""))
 
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(destino))
+    return destino
+
+
+def generar_planilla_agil(faltantes: list[dict], destino: Path, semana: str = "") -> Path:
+    """Archivo suelto con SOLO las columnas de la planilla de Ágil."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    _hoja_carga(wb, faltantes, semana)
     destino.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(destino))
     return destino
@@ -634,6 +724,7 @@ def importar_verificacion(path: str | Path) -> tuple[dict, list[dict]]:
                 "monto_img": utils.parse_monto(val(fila, "Monto (imagen)")),
                 "nombre_pie": str(val(fila, "Nombre (pie)") or ""),
                 "monto_pie": utils.parse_monto(val(fila, "Monto (pie)")),
+                "pie": f"{val(fila, 'Nombre (pie)') or ''} {val(fila, 'Monto (pie)') or ''}".strip(),
                 "banco": str(val(fila, "Banco") or ""),
                 "nro_operacion": str(val(fila, "N° operación") or ""),
                 "fecha_comp": str(val(fila, "Fecha comprobante") or ""),
