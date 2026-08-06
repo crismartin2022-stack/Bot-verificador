@@ -39,6 +39,12 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 MODELO = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5").strip()
 MAX_TOKENS = _int("ANTHROPIC_MAX_TOKENS", 1200)
 
+# --- Cloudinary (opcional; se puede compartir con otro bot) ---
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "comprobantes").strip()
+
 # --- Almacenamiento (Railway Volume montado en /data) ---
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 HISTORIAL_FILE = DATA_DIR / "historial.json"
