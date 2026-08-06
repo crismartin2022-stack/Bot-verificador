@@ -95,8 +95,11 @@ class Storage:
             return self.historial["por_huella"][huella]
         return None
 
-    async def registrar(self, item: dict) -> None:
-        """Guarda el comprobante en el historial global (si es nuevo)."""
+    async def registrar(self, item: dict, actualizar: bool = False) -> None:
+        """Guarda el comprobante en el historial global.
+
+        Con actualizar=True pisa lo que hubiera (re-verificación forzada).
+        """
         resumen = {
             "chat_id": item.get("chat_id"),
             "chat": item.get("chat"),
@@ -111,6 +114,8 @@ class Storage:
             # a pagar una llamada a Claude si se re-verifica el mismo mensaje.
             "banco": item.get("banco"),
             "fecha_comp": item.get("fecha_comp"),
+            "hora_comp": item.get("hora_comp"),
+            "cvu_destino": item.get("cvu_destino"),
             "confianza": item.get("confianza"),
             "nombre_origen": item.get("nombre_origen"),
             "nombre_destino": item.get("nombre_destino"),
@@ -129,9 +134,11 @@ class Storage:
                 self.historial["por_archivo"][ha] = resumen
                 cambio = True
             clave_msg = f"{item.get('chat_id')}:{item.get('msg_id')}"
-            if item.get("msg_id") and clave_msg not in self.historial.setdefault("por_mensaje", {}):
-                self.historial["por_mensaje"][clave_msg] = resumen
-                cambio = True
+            if item.get("msg_id"):
+                previo = self.historial.setdefault("por_mensaje", {}).get(clave_msg)
+                if previo != resumen:
+                    self.historial["por_mensaje"][clave_msg] = resumen
+                    cambio = True
             if cambio:
                 await self._flush()
 
@@ -209,6 +216,19 @@ class Storage:
                 await asyncio.to_thread(p.replace, archivo)
                 return True
         return False
+
+    async def olvidar_chat(self, chat_id: int) -> int:
+        """Borra del historial todo lo de un chat (se va a releer con API)."""
+        async with self._lock:
+            borrados = 0
+            for indice in ("por_mensaje", "por_huella", "por_archivo"):
+                tabla = self.historial.get(indice, {})
+                for k in [k for k, v in tabla.items() if v.get("chat_id") == chat_id]:
+                    tabla.pop(k, None)
+                    borrados += 1
+            if borrados:
+                await self._flush()
+            return borrados
 
     async def ultimas_verificaciones(self, limite: int = 10) -> list[dict]:
         archivos = sorted(
