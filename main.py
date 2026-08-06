@@ -333,7 +333,7 @@ class Bot:
         return None
 
     async def procesar(self, msg, pie: str, ctx: dict, estado: dict) -> dict:
-        nombre_pie, monto_pie = utils.parse_pie(pie)
+        nombre_pie, monto_pie, doc_pie = utils.parse_pie(pie)
         remitente = ""
         try:
             s = await msg.get_sender()
@@ -346,6 +346,7 @@ class Bot:
             "fecha_msg": utils.a_local(msg.date, config.TZ).strftime("%d/%m/%Y %H:%M"),
             "remitente": remitente, "remitente_id": msg.sender_id,
             "pie": pie, "nombre_pie": nombre_pie, "monto_pie": monto_pie,
+            "doc_pie": doc_pie,
             "link": link_mensaje(ctx["chat_id"], msg.id, ctx.get("username")),
         }
 
@@ -356,19 +357,25 @@ class Bot:
             datos = {
                 "es_comprobante": True,
                 "monto_num": previo_msg.get("monto"),
-                "nombre_destino": previo_msg.get("nombre") or "",
+                "nombre_origen": previo_msg.get("nombre_origen") or previo_msg.get("nombre") or "",
+                "nombre_destino": previo_msg.get("nombre_destino") or previo_msg.get("nombre") or "",
+                "cuit_origen": previo_msg.get("cuit_origen") or "",
+                "cuit_destino": previo_msg.get("cuit_destino") or "",
                 "banco": previo_msg.get("banco") or "",
                 "nro_operacion": previo_msg.get("nro_operacion") or "",
                 "fecha": previo_msg.get("fecha_comp") or "",
                 "confianza": previo_msg.get("confianza") if previo_msg.get("confianza") is not None else 1.0,
             }
             item.update(
-                nombre_img=datos["nombre_destino"], monto_img=datos["monto_num"],
+                nombre_img=datos["nombre_origen"] or datos["nombre_destino"],
+                nombre_origen=datos["nombre_origen"], nombre_destino=datos["nombre_destino"],
+                cuit_origen=datos.get("cuit_origen", ""), cuit_destino=datos.get("cuit_destino", ""),
+                monto_img=datos["monto_num"],
                 banco=datos["banco"], nro_operacion=datos["nro_operacion"],
                 fecha_comp=datos["fecha"], confianza=datos["confianza"],
                 huella=utils.huella_comprobante(datos), reusado=True,
             )
-            veredicto = an.comparar(datos, nombre_pie, monto_pie)
+            veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
             item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
                         sim_nombre=veredicto["sim_nombre"])
             estado["reusados"] = estado.get("reusados", 0) + 1
@@ -403,12 +410,15 @@ class Bot:
                     "confianza": previo.get("confianza") if previo.get("confianza") is not None else 1.0,
                 }
                 item.update(
-                    nombre_img=datos["nombre_destino"], monto_img=datos["monto_num"],
+                    nombre_img=datos["nombre_origen"] or datos["nombre_destino"],
+                nombre_origen=datos["nombre_origen"], nombre_destino=datos["nombre_destino"],
+                cuit_origen=datos.get("cuit_origen", ""), cuit_destino=datos.get("cuit_destino", ""),
+                monto_img=datos["monto_num"],
                     banco=datos["banco"], nro_operacion=datos["nro_operacion"],
                     fecha_comp=datos["fecha"], confianza=datos["confianza"],
                     huella=utils.huella_comprobante(datos), reusado=True,
                 )
-                veredicto = an.comparar(datos, nombre_pie, monto_pie)
+                veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
                 item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
                             sim_nombre=veredicto["sim_nombre"])
                 estado["reusados"] = estado.get("reusados", 0) + 1
@@ -428,7 +438,12 @@ class Bot:
 
         datos = await self.analizador.leer_comprobante(data, "image/jpeg")
         item.update(
-            nombre_img=datos.get("nombre_destino") or datos.get("nombre_origen") or "",
+            nombre_img=datos.get("nombre_origen") or datos.get("nombre_destino") or "",
+            nombre_origen=datos.get("nombre_origen") or "",
+            nombre_destino=datos.get("nombre_destino") or "",
+            cuit_origen=datos.get("cuit_origen") or "",
+            cuit_destino=datos.get("cuit_destino") or "",
+            cvu_destino=datos.get("cvu_destino") or "",
             monto_img=datos.get("monto_num"),
             banco=datos.get("banco") or "",
             nro_operacion=datos.get("nro_operacion") or "",
@@ -451,7 +466,7 @@ class Bot:
                 return item
             await self.storage.registrar(item)
 
-        veredicto = an.comparar(datos, nombre_pie, monto_pie)
+        veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
         item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
                     sim_nombre=veredicto["sim_nombre"])
         estado["procesados"] += 1
