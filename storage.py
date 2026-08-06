@@ -143,6 +143,52 @@ class Storage:
             "actualizado": self.historial.get("actualizado"),
         }
 
+    # ------------------------------------------------- referencia acumulada
+    @property
+    def referencia_file(self) -> Path:
+        return self.historial_file.parent / "referencia.json"
+
+    async def cargar_referencia(self) -> dict:
+        return await asyncio.to_thread(
+            _leer_json, self.referencia_file, {"archivos": [], "filas": []}
+        )
+
+    async def sumar_referencia(self, archivo: str, filas: list[dict], desc: str) -> dict:
+        """Agrega las filas de un Excel al conjunto de referencia."""
+        async with self._lock:
+            ref = await asyncio.to_thread(
+                _leer_json, self.referencia_file, {"archivos": [], "filas": []}
+            )
+            vistas = {
+                (f.get("archivo"), f.get("hoja"), f.get("fila")) for f in ref["filas"]
+            }
+            nuevas = 0
+            for f in filas:
+                clave = (archivo, f.get("hoja"), f.get("fila"))
+                if clave in vistas:
+                    continue
+                f = dict(f)
+                f["archivo"] = archivo
+                ref["filas"].append(f)
+                vistas.add(clave)
+                nuevas += 1
+            ref["archivos"] = [a for a in ref["archivos"] if a["nombre"] != archivo]
+            ref["archivos"].append({"nombre": archivo, "filas": nuevas, "desc": desc,
+                                    "agregado": _ahora()})
+            await asyncio.to_thread(_escribir_json, self.referencia_file, ref)
+            return ref
+
+    async def limpiar_referencia(self) -> int:
+        async with self._lock:
+            ref = await asyncio.to_thread(
+                _leer_json, self.referencia_file, {"archivos": [], "filas": []}
+            )
+            n = len(ref["filas"])
+            await asyncio.to_thread(
+                _escribir_json, self.referencia_file, {"archivos": [], "filas": []}
+            )
+            return n
+
     # -------------------------------------------------------- verificaciones
     def _path_verif(self, chat_id: int) -> Path:
         return self.verif_dir / f"{chat_id}.json"
