@@ -26,7 +26,11 @@ Reglas:
 - "monto" es el importe transferido/pagado. NUNCA el saldo de la cuenta,
   ni el disponible, ni comisiones, ni CVU/CBU.
 - "nombre_destino" es quien RECIBE el dinero (Para / Destinatario / Destino).
-  "nombre_origen" es quien envía (De / Origen / Titular de la cuenta).
+  "nombre_origen" es quien ENVÍA / paga (De / Origen / Titular de la cuenta).
+  Extraé SIEMPRE los dos si están, aunque uno sea una empresa.
+- "cuit_origen" y "cuit_destino": CUIT/CUIL/DNI de cada parte, solo dígitos
+  o con guiones tal como figura. Si ves un solo documento y no sabés de quién
+  es, poné el que corresponda al titular de la cuenta que envía.
 - Si un dato no está visible, poné null. No inventes NADA.
 - "confianza" refleja qué tan legible está la imagen (0 a 1).
 - Si la imagen no es un comprobante de pago/transferencia, es_comprobante = false.
@@ -41,6 +45,7 @@ Formato exacto:
   "fecha": "2026-08-04",
   "hora": "14:35",
   "nombre_origen": null,
+  "cuit_origen": null,
   "nombre_destino": "JUAN PEREZ",
   "cuit_destino": null,
   "cvu_destino": null,
@@ -55,7 +60,7 @@ USER_PROMPT = (
 )
 
 CAMPOS = (
-    "es_comprobante banco tipo monto moneda fecha hora nombre_origen "
+    "es_comprobante banco tipo monto moneda fecha hora nombre_origen cuit_origen "
     "nombre_destino cuit_destino cvu_destino nro_operacion estado confianza observaciones"
 ).split()
 
@@ -171,8 +176,14 @@ ESTADOS = {
 }
 
 
-def comparar(datos_img: dict, nombre_pie: str, monto_pie: float | None) -> dict:
-    """Contrasta lo leído en la imagen contra lo declarado en el pie."""
+def comparar(datos_img: dict, nombre_pie: str, monto_pie: float | None,
+             doc_pie: str = "") -> dict:
+    """Contrasta lo leído en la imagen contra lo declarado en el pie.
+
+    El pie suele traer al CLIENTE que paga, y el comprobante puede mostrar
+    tanto al que envía como a la empresa que recibe: se acepta cualquiera
+    de los dos. Si hay DNI/CUIT en ambos lados, manda el documento.
+    """
     if not datos_img.get("es_comprobante"):
         return {
             "estado": "no_comprobante",
@@ -182,24 +193,30 @@ def comparar(datos_img: dict, nombre_pie: str, monto_pie: float | None) -> dict:
 
     conf = float(datos_img.get("confianza") or 0)
     monto_img = datos_img.get("monto_num")
-    nombre_img = datos_img.get("nombre_destino") or datos_img.get("nombre_origen") or ""
+    nombres_img = [n for n in (datos_img.get("nombre_origen"),
+                               datos_img.get("nombre_destino")) if n]
+    nombre_img = " / ".join(nombres_img) if nombres_img else ""
 
     if conf < config.CONFIANZA_MIN or monto_img is None:
         return {
             "estado": "ilegible",
             "detalle": f"confianza {conf:.2f}, monto leído: {utils.fmt_monto(monto_img)}",
-            "sim_nombre": utils.similitud_nombres(nombre_img, nombre_pie),
+            "sim_nombre": max([utils.similitud_nombres(n, nombre_pie) for n in nombres_img] or [0.0]),
         }
 
-    if not nombre_pie and monto_pie is None:
+    if not nombre_pie and monto_pie is None and not doc_pie:
         return {"estado": "sin_pie", "detalle": "el mensaje no trae nombre ni monto", "sim_nombre": 0.0}
 
-    sim = utils.similitud_nombres(nombre_img, nombre_pie)
-    ok_nombre = sim >= config.UMBRAL_NOMBRE if nombre_pie else True
+    docs_img = [datos_img.get("cuit_origen"), datos_img.get("cuit_destino")]
+    doc_ok = bool(doc_pie) and any(utils.docs_iguales(d, doc_pie) for d in docs_img if d)
+
+    sim = max([utils.similitud_nombres(n, nombre_pie) for n in nombres_img] or [0.0])
+    ok_nombre = True if not nombre_pie else (sim >= config.UMBRAL_NOMBRE or doc_ok)
     ok_monto = utils.montos_iguales(monto_img, monto_pie, config.TOLERANCIA_MONTO) if monto_pie is not None else True
 
     if ok_nombre and ok_monto:
-        estado, detalle = "ok", "nombre y monto coinciden"
+        estado = "ok"
+        detalle = "coinciden por documento" if doc_ok and sim < config.UMBRAL_NOMBRE else "nombre y monto coinciden"
     elif not ok_nombre and not ok_monto:
         estado = "ambos"
         detalle = (f"imagen: {nombre_img} / {utils.fmt_monto(monto_img)} · "
