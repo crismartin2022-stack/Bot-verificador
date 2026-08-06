@@ -24,28 +24,69 @@ CLAVES_HORA = ("hora",)
 ENCABEZADOS_RUIDO = {"NOMBRE", "MONTO", "IMPORTE", "TITULAR", "CLIENTE", "FECHA", "TOTAL",
                      "APELLIDO", "NOMBRE Y APELLIDO", "BENEFICIARIO", "DESTINATARIO"}
 
+# Peso de cada palabra por campo. Más alto = más confiable.
+# Evita que «TRF O DEPOSITO» gane sobre «MONTO», o «TITULAR DE LA CTA»
+# (la empresa que cobra) sobre «Remitente» (el cliente que paga).
+PESOS = {
+    "nombre": [("nombre y apellido", 10), ("remitente", 10), ("pagador", 10),
+               ("nombre", 9), ("apellido", 8), ("cliente", 8), ("beneficiario", 7),
+               ("titular", 6), ("destinatario", 5), ("socio", 5), ("alumno", 5),
+               ("persona", 5), ("paciente", 5)],
+    "monto": [("monto", 10), ("importe", 10), ("valor", 7), ("total", 6),
+              ("abono", 5), ("pago", 5), ("deposito", 3)],
+    "doc": [("cuit", 10), ("cuil", 10), ("dni", 10), ("documento", 9),
+            ("nro doc", 9), ("doc", 7), ("cvu", 4), ("cbu", 4)],
+    "fecha": [("fecha ticket", 10), ("fecha op", 10), ("fecha operacion", 10),
+              ("fecha", 7), ("dia", 4)],
+    "hora": [("hora ticket", 10), ("hora", 9)],
+    "oper": [("nro operacion", 10), ("n operacion", 10), ("operacion", 9),
+             ("codigo", 8), ("referencia", 8), ("comprobante", 6)],
+    "notas": [("notas", 10), ("observaciones", 10), ("observacion", 9), ("detalle", 6)],
+}
+
+
+def _peso(titulo: str, campo: str) -> float:
+    t = utils.normalizar(titulo).lower()
+    if not t:
+        return 0.0
+    mejor = 0.0
+    for clave, peso in PESOS[campo]:
+        if t == clave:
+            calidad = 1.0
+        elif t.startswith(clave) or t.endswith(clave):
+            calidad = 0.9
+        elif clave in t:
+            calidad = 0.7
+        else:
+            continue
+        mejor = max(mejor, peso * calidad)
+    return mejor
+
 
 def _detectar_columnas(hoja, max_filas: int = 15) -> tuple[int, dict]:
-    """Devuelve (fila_encabezado, {'nombre': idx, 'monto': idx, 'fecha': idx})."""
+    """Devuelve (fila_encabezado, {campo: nº de columna}).
+
+    Se elige la mejor columna para cada campo, no la primera que coincida.
+    """
     for fila in range(1, min(max_filas, hoja.max_row or 1) + 1):
-        mapa = {}
+        opciones = []
         for col in range(1, min(hoja.max_column or 1, 40) + 1):
             val = hoja.cell(row=fila, column=col).value
             if not isinstance(val, str):
                 continue
-            t = utils.normalizar(val).lower()
-            if not t:
+            for campo in PESOS:
+                p = _peso(val, campo)
+                if p > 0:
+                    opciones.append((p, campo, col))
+
+        mapa: dict[str, int] = {}
+        usadas: set[int] = set()
+        for _, campo, col in sorted(opciones, key=lambda x: -x[0]):
+            if campo in mapa or col in usadas:
                 continue
-            if "doc" not in mapa and any(k == t or t.startswith(k) for k in CLAVES_DOC):
-                mapa["doc"] = col
-            elif "nombre" not in mapa and any(k in t for k in CLAVES_NOMBRE):
-                mapa["nombre"] = col
-            elif "monto" not in mapa and any(k in t for k in CLAVES_MONTO):
-                mapa["monto"] = col
-            elif "hora" not in mapa and any(k in t for k in CLAVES_HORA):
-                mapa["hora"] = col
-            elif "fecha" not in mapa and any(k in t for k in CLAVES_FECHA):
-                mapa["fecha"] = col
+            mapa[campo] = col
+            usadas.add(col)
+
         if "nombre" in mapa and "monto" in mapa:
             return fila, mapa
     # Sin encabezados reconocibles: asumimos A=nombre, B=monto
@@ -105,12 +146,28 @@ def leer_excel(path: str | Path, hojas: list[str] | None = None) -> tuple[list[d
             hora = celda("hora")
             if hasattr(hora, "strftime"):
                 hora = hora.strftime("%H:%M")
+
+            # Código de operación: columna propia o dentro de las notas
+            oper = str(celda("oper") or "").strip()
+            notas = str(celda("notas") or "")
+            doc = utils.clave_doc(celda("doc"))
+            if notas:
+                if not oper:
+                    m_op = re.search(r"(?i)c[oó]digo[^:]*:\s*([A-Z0-9-]{6,})", notas)
+                    if m_op:
+                        oper = m_op.group(1)
+                if not doc:
+                    m_cvu = re.search(r"(?i)cvu\s*remitente\s*:?\s*(\d{10,22})", notas)
+                    if m_cvu:
+                        doc = utils.clave_doc(m_cvu.group(1))
+
             filas.append({
                 "hoja": hoja.title,
                 "fila": i,
                 "nombre": nombre,
                 "monto": monto,
-                "doc": utils.clave_doc(celda("doc")),
+                "doc": doc,
+                "oper": utils.normalizar(oper),
                 "fecha": str(fecha) if fecha else "",
                 "hora": str(hora) if hora else "",
             })
@@ -158,6 +215,7 @@ def _perfil(it: dict) -> dict:
         montos.append(m_pie)
 
     perfil = {
+        "opers": {utils.normalizar(o) for o in (it.get("nro_operacion"),) if o and len(str(o)) >= 6},
         "nombres": [n for n in nombres if n and utils.tokens_nombre(n)],
         "docs": {utils.clave_doc(d) for d in docs if utils.clave_doc(d)},
         "montos": [m for m in montos if m is not None],
@@ -178,6 +236,10 @@ def _fecha_item(perfil: dict) -> str:
 
 def _puntaje(perfil: dict, fila: dict) -> float:
     """-1 = no aparea. Si aparea, cuanto más alto, mejor candidato."""
+    # 0) El número de operación es único: si coincide, es la misma transferencia
+    if fila.get("oper") and fila["oper"] in perfil["opers"]:
+        return 10.0
+
     # 1) El monto es el ancla: tiene que coincidir con alguno de los del chat
     if fila["monto"] is None or not perfil["montos"]:
         return -1.0
@@ -248,8 +310,19 @@ def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
     usados: set[int] = set()
     coinciden, solo_excel = [], []
 
+    por_oper: dict[str, int] = {}
+    for j, p in enumerate(perfiles):
+        for o in p["opers"]:
+            por_oper.setdefault(o, j)
+
     for fila in filas_excel:
         mejor, mejor_p = None, 0.0
+        j_op = por_oper.get(fila.get("oper") or "\x00")
+        if j_op is not None and j_op not in usados:
+            usados.add(j_op)
+            coinciden.append({"excel": fila, "chat": disponibles[j_op],
+                              "similitud": 1.0, "por_doc": True})
+            continue
         if fila["monto"] is not None:
             cercanos = set(indice.get(round(fila["monto"], 2), []))
             if config.TOLERANCIA_MONTO:
@@ -271,8 +344,6 @@ def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
             solo_excel.append(fila)
 
     solo_chat = [it for j, it in enumerate(disponibles) if j not in usados]
-    for it in disponibles:
-        it.pop("_perfil", None)
 
     return {
         "coinciden": coinciden,
@@ -352,9 +423,10 @@ def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
     resumen.column_dimensions["B"].width = 40
 
     _hoja(wb, "✅ Coinciden",
-          ["Nombre (Excel)", "Monto (Excel)", "Fila", "Grupo", "Nombre (imagen)",
-           "Monto (imagen)", "Similitud", "Fecha msg", "Mensaje"],
-          [[c["excel"]["nombre"], c["excel"]["monto"], c["excel"]["fila"],
+          ["Nombre (Excel)", "Monto (Excel)", "Hoja", "Fila", "Apareo", "Grupo",
+           "Nombre (imagen)", "Monto (imagen)", "Similitud", "Fecha msg", "Mensaje"],
+          [[c["excel"]["nombre"], c["excel"]["monto"], c["excel"].get("hoja", ""),
+            c["excel"]["fila"], "documento/operación" if c.get("por_doc") else "nombre+monto",
             c["chat"].get("chat", ""), _datos_item(c["chat"])[0], _datos_item(c["chat"])[1],
             round(c["similitud"], 2), c["chat"].get("fecha_msg", ""), c["chat"].get("link", "")]
            for c in res["coinciden"]], "ok")
@@ -366,14 +438,17 @@ def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
            for d in res["duplicados"]], "dup")
 
     _hoja(wb, "⚠️ Solo en chat",
-          ["Grupo", "Nombre", "Monto", "Estado", "Detalle", "Fecha msg", "Remitente", "Mensaje"],
-          [[s.get("chat", ""), _datos_item(s)[0], _datos_item(s)[1], s.get("estado", ""),
+          ["Grupo", "Nombre", "Monto", "Documento", "Estado", "Detalle", "Fecha msg",
+           "Remitente", "Mensaje"],
+          [[s.get("chat", ""), _datos_item(s)[0], _datos_item(s)[1],
+            (sorted(_perfil(s)["docs"]) or [""])[0], s.get("estado", ""),
             s.get("detalle", ""), s.get("fecha_msg", ""), s.get("remitente", ""), s.get("link", "")]
            for s in res["solo_chat"]], "chat")
 
     _hoja(wb, "❌ Solo en Excel",
-          ["Nombre", "Monto", "Fecha", "Fila del Excel"],
-          [[s["nombre"], s["monto"], s.get("fecha", ""), s["fila"]] for s in res["solo_excel"]],
+          ["Nombre", "Monto", "Documento", "Fecha", "Hora", "Archivo", "Hoja", "Fila"],
+          [[s["nombre"], s["monto"], s.get("doc", ""), s.get("fecha", ""), s.get("hora", ""),
+            s.get("archivo", ""), s.get("hoja", ""), s["fila"]] for s in res["solo_excel"]],
           "excel")
 
     destino.parent.mkdir(parents=True, exist_ok=True)
