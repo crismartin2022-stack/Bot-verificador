@@ -112,6 +112,11 @@ class Storage:
             "banco": item.get("banco"),
             "fecha_comp": item.get("fecha_comp"),
             "confianza": item.get("confianza"),
+            "nombre_origen": item.get("nombre_origen"),
+            "nombre_destino": item.get("nombre_destino"),
+            "cuit_origen": item.get("cuit_origen"),
+            "cuit_destino": item.get("cuit_destino"),
+            "doc_pie": item.get("doc_pie"),
             "registrado": _ahora(),
         }
         async with self._lock:
