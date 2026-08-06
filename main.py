@@ -12,6 +12,11 @@ Cruce con Excel: mandá el .xlsx al privado. En el pie del archivo podés poner:
   (nada)                 cruza contra TODOS los grupos verificados, todas las hojas
   /excel 30-7            todos los grupos, solo la hoja «30-7»
   /excel -100123 30-7    solo ese grupo, solo esa hoja
+
+Varias semanas en archivos separados:
+  /sumar                 (pie del archivo) acumula ese Excel a la referencia
+  /faltantes             consolidado: qué hay en los chats y en NINGÚN Excel
+  /sumar limpiar         vacía la referencia acumulada
 """
 from __future__ import annotations
 
@@ -43,7 +48,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 RE_CMD = re.compile(
-    r"(?i)^/(grupos|verificar|reset|estado|cancelar|ayuda|start|excel|importar)(?:@\w+)?\s*(.*)$",
+    r"(?i)^/(grupos|verificar|reset|estado|cancelar|ayuda|start|excel|importar|sumar|faltantes)(?:@\w+)?\s*(.*)$",
     re.DOTALL,
 )
 
@@ -140,6 +145,26 @@ class Bot:
                 await self.cmd_estado(event)
             elif cmd == "cancelar":
                 await self.cmd_cancelar(event, resto)
+            elif cmd == "faltantes":
+                await self.cmd_faltantes(event, resto)
+            elif cmd == "sumar":
+                if resto.strip().lower().startswith("limpiar"):
+                    n = await self.storage.limpiar_referencia()
+                    await event.respond(f"🧹 Referencia vaciada ({n} filas).")
+                else:
+                    ref = await self.storage.cargar_referencia()
+                    if not ref["archivos"]:
+                        await event.respond(
+                            "Mandame cada Excel semanal con el pie `/sumar`.\n"
+                            "Cuando estén todos, pedí `/faltantes`.")
+                    else:
+                        await event.respond(
+                            f"📚 Referencia acumulada: **{len(ref['filas'])}** filas de "
+                            f"{len(ref['archivos'])} archivo(s)\n"
+                            + "\n".join(f"  · {a['nombre']} — {a['filas']} filas"
+                                        for a in ref["archivos"])
+                            + "\n\nPedí `/faltantes` para el consolidado, o "
+                              "`/sumar limpiar` para empezar de nuevo.")
             elif cmd == "importar":
                 await event.respond(
                     "Adjuntá una planilla `verificacion_*.xlsx` que te haya mandado el bot.\n"
@@ -629,6 +654,20 @@ class Bot:
                 await self.importar_planilla(event, tmp, nombre)
                 return
 
+            # Modo acumulativo: /sumar guarda las filas para el consolidado
+            if re.match(r"(?i)\s*/sumar\b", pie):
+                filas, desc = await asyncio.to_thread(xl.leer_excel, tmp, hojas)
+                if not filas:
+                    await event.respond(f"No pude leer filas.\n_{desc}_")
+                    return
+                ref = await self.storage.sumar_referencia(nombre, filas, desc)
+                await event.respond(
+                    f"➕ Sumado `{nombre}`: {len(filas)} filas\n"
+                    f"📚 Referencia total: **{len(ref['filas'])}** filas de "
+                    f"{len(ref['archivos'])} archivo(s)\n\n"
+                    "Seguí mandando semanas, o pedí `/faltantes`.")
+                return
+
             # A partir de acá: Excel de referencia para cruzar.
             if not ids:
                 ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
@@ -706,6 +745,72 @@ class Bot:
             await event.respond(f"⚠️ No pude procesar el Excel: `{type(e).__name__}: {e}`")
         finally:
             tmp.unlink(missing_ok=True)
+
+    async def cmd_faltantes(self, event, resto: str):
+        """Cruza TODOS los grupos contra TODOS los Excel acumulados."""
+        ref = await self.storage.cargar_referencia()
+        if not ref["filas"]:
+            await event.respond(
+                "No hay Excel acumulados todavía.\n"
+                "Mandame cada semana con el pie `/sumar` y después pedí `/faltantes`.")
+            return
+
+        ids = [int(x) for x in re.findall(r"-?\d{6,}", resto)]
+        if not ids:
+            ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
+        items, grupos = [], []
+        for cid in ids:
+            v = await self.storage.cargar_verificacion(cid)
+            if not v:
+                continue
+            etiqueta = v.get("chat") or str(v.get("chat_id"))
+            grupos.append(etiqueta)
+            for it in v.get("items", []):
+                it.setdefault("chat", etiqueta)
+                it.setdefault("chat_id", v.get("chat_id"))
+                items.append(it)
+        if not items:
+            await event.respond("No hay verificaciones guardadas para cruzar.")
+            return
+
+        aviso = await event.respond(
+            f"🔎 Cruzando **{len(items)}** comprobantes de {len(grupos)} grupo(s) "
+            f"contra **{len(ref['filas'])}** filas de {len(ref['archivos'])} archivo(s)…")
+        try:
+            res = await asyncio.to_thread(xl.cruzar, items, ref["filas"])
+            ruta = config.REPORTES_DIR / f"faltantes_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            await asyncio.to_thread(
+                xl.generar_reporte, res,
+                {"chat": ", ".join(grupos), "chat_id": ids[0] if ids else "",
+                 "archivo": " + ".join(a["nombre"] for a in ref["archivos"]),
+                 "grupos": grupos}, ruta,
+            )
+            lineas = [
+                "📊 **Consolidado de faltantes**",
+                f"Archivos: {len(ref['archivos'])} · filas de referencia: {len(ref['filas'])}",
+                f"Grupos: {len(grupos)} · comprobantes: {res['total_chat']}",
+                "",
+                f"✅ Coinciden: **{len(res['coinciden'])}**",
+                f"🔁 Duplicados / reenviados: **{len(res['duplicados'])}**",
+                f"⚠️ En el chat y NO en ningún Excel: **{len(res['solo_chat'])}**",
+                f"❌ En el Excel y sin comprobante: **{len(res['solo_excel'])}**",
+            ]
+            if res["solo_chat"]:
+                total = sum((xl._datos_item(s)[1] or 0) for s in res["solo_chat"])
+                lineas.append(f"\n💰 Monto sin cargar: **{utils.fmt_monto(total)}**")
+                lineas.append("\n**⚠️ Sin respaldo en ningún Excel:**")
+                for it in res["solo_chat"][:30]:
+                    n, mo = xl._datos_item(it)
+                    lineas.append(f"• [{it.get('chat', '')}] {n or '?'} — {utils.fmt_monto(mo)} · "
+                                  f"{it.get('fecha_msg', '')} {it.get('link', '')}")
+                if len(res["solo_chat"]) > 30:
+                    lineas.append(f"… y {len(res['solo_chat']) - 30} más en la planilla.")
+            await aviso.delete()
+            await self.responder_largo(event, "\n".join(lineas))
+            await event.respond(file=str(ruta), message="📎 Consolidado completo.")
+        except Exception as e:
+            log.exception("Error en /faltantes")
+            await event.respond(f"⚠️ No pude armar el consolidado: `{type(e).__name__}: {e}`")
 
     async def importar_planilla(self, event, tmp, nombre: str):
         """Reconstruye una verificación desde una planilla del propio bot."""
