@@ -356,6 +356,7 @@ def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
 
 
 # ------------------------------------------------------------------ reporte
+
 _CAB = Font(bold=True, color="FFFFFF")
 _FILL = {
     "ok": PatternFill("solid", fgColor="1E7B34"),
@@ -364,6 +365,64 @@ _FILL = {
     "excel": PatternFill("solid", fgColor="A32020"),
     "res": PatternFill("solid", fgColor="333333"),
 }
+
+
+COLUMNAS_CARGA = ["#", "GRUPO", "FECHA DE ENVIO", "TRF O DEPOSITO", "TITULAR DE LA CTA",
+                  "FECHA TICKET", "HORA TICKET", "CUENTA (CVU)", "MONTO", "Remitente",
+                  "CUIL Remitente", "Banco Origen", "Estado", "Origen", "Notas", "Imagen"]
+
+
+def _fecha_ar(valor) -> str:
+    """yyyy-mm-dd -> dd/mm/yyyy. Lo demás se devuelve tal cual."""
+    t = str(valor or "").strip()[:10]
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})$", t)
+    return f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else t
+
+
+def _hoja_carga(wb, faltantes: list[dict], semana: str = ""):
+    """Los faltantes con el formato exacto de la planilla, listos para pegar."""
+    ws = wb.create_sheet("📋 Para cargar")
+    ws.append(COLUMNAS_CARGA)
+    for c in range(1, len(COLUMNAS_CARGA) + 1):
+        celda = ws.cell(row=1, column=c)
+        celda.font = _CAB
+        celda.fill = _FILL["chat"]
+        celda.alignment = Alignment(horizontal="center")
+
+    for n, it in enumerate(faltantes, 1):
+        perfil = _perfil(it)
+        remitente = (it.get("nombre_origen") or it.get("nombre_pie")
+                     or it.get("nombre_img") or "")
+        doc = it.get("cuit_origen") or it.get("doc_pie") or (sorted(perfil["docs"]) or [""])[0]
+        notas = " · ".join(x for x in [
+            f"Código de identificación: {it.get('nro_operacion')}" if it.get("nro_operacion") else "",
+            f"CVU destinatario: {it.get('cvu_destino')}" if it.get("cvu_destino") else "",
+            it.get("detalle") or "",
+        ] if x)
+        ws.append([
+            n,
+            it.get("chat", ""),
+            semana,
+            "TRF",
+            it.get("nombre_destino") or "",
+            _fecha_ar(it.get("fecha_comp")),
+            it.get("hora_comp") or "",
+            it.get("cvu_destino") or "",
+            _datos_item(it)[1],
+            remitente,
+            doc,
+            it.get("banco") or "",
+            "Exitoso" if it.get("estado") == "ok" else (it.get("estado") or ""),
+            "grupo",
+            notas,
+            f'=HYPERLINK("{it.get("link", "")}","Ver imagen")' if it.get("link") else "",
+        ])
+
+    anchos = [5, 24, 18, 10, 22, 13, 12, 14, 14, 26, 16, 16, 12, 10, 45, 12]
+    for c, a in enumerate(anchos, 1):
+        ws.column_dimensions[get_column_letter(c)].width = a
+    ws.freeze_panes = "A2"
+    return ws
 
 
 def _hoja(wb, titulo, cabeceras, filas, color):
@@ -450,6 +509,9 @@ def generar_reporte(res: dict, meta: dict, destino: Path) -> Path:
           [[s["nombre"], s["monto"], s.get("doc", ""), s.get("fecha", ""), s.get("hora", ""),
             s.get("archivo", ""), s.get("hoja", ""), s["fila"]] for s in res["solo_excel"]],
           "excel")
+
+    if res["solo_chat"]:
+        _hoja_carga(wb, res["solo_chat"], meta.get("semana", ""))
 
     destino.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(destino))
