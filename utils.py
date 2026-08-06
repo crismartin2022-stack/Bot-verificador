@@ -131,36 +131,117 @@ def montos_iguales(a: float | None, b: float | None, tolerancia: float = 0.0) ->
     return abs(a - b) <= max(tolerancia, 0.009)
 
 
+# ------------------------------------------------------------------ documentos
+_RE_DOC_ETIQUETA = re.compile(
+    r"(?i)\b(?:cuit|cuil|dni|doc(?:umento)?|nro\.?\s*doc)\b[\s:./-]*"
+    r"(\d{2}[-.\s]?\d{7,8}[-.\s]?\d|\d{1,3}(?:[.\s]\d{3}){2,3}|\d{7,11})"
+)
+_RE_CUIT = re.compile(r"\b(\d{2}[-.\s]\d{7,8}[-.\s]\d)\b")
+
+
+def clave_doc(valor) -> str:
+    """Normaliza CUIT/CUIL/DNI/CVU a una clave comparable.
+
+    '20-44141951-3', '20441419513' y '44141951' -> la misma persona.
+    Los números largos (CVU/CBU/ID) se recortan por precisión de Excel.
+    """
+    if valor is None:
+        return ""
+    txt = str(valor)
+    if "e+" in txt.lower():                     # Excel guardó 8.57e+16
+        try:
+            txt = f"{float(txt):.0f}"
+        except ValueError:
+            pass
+    d = re.sub(r"\D", "", txt)
+    if len(d) < 7 or set(d) == {"0"}:
+        return ""
+    if len(d) == 11:
+        return d[2:10]
+    if len(d) in (7, 8):
+        return d.zfill(8)
+    return d
+
+
+def extraer_doc(texto: str) -> str:
+    """Saca el DNI/CUIT de un texto libre. '' si no hay."""
+    if not texto:
+        return ""
+    m = _RE_DOC_ETIQUETA.search(texto)
+    if m:
+        return clave_doc(m.group(1))
+    m = _RE_CUIT.search(texto)
+    if m:
+        return clave_doc(m.group(1))
+    return ""
+
+
+def docs_iguales(a, b) -> bool:
+    ka, kb = clave_doc(a), clave_doc(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    # CVU/CBU/IDs largos: Excel pierde precisión en los últimos dígitos
+    if len(ka) >= 12 and len(kb) >= 12:
+        n = min(len(ka), len(kb), 14)
+        return ka[:n] == kb[:n]
+    return False
+
+
 # ------------------------------------------------------------------ pie
-def parse_pie(texto: str) -> tuple[str, float | None]:
-    """Del pie de foto saca (nombre, monto). Formatos tolerados:
-    'Juan Perez 15000' · 'JUAN PEREZ - $15.000' · 'Monto: 15.000 Nombre: Juan Perez'
+def parse_pie(texto: str) -> tuple[str, float | None, str]:
+    """Del pie de foto saca (nombre, monto, documento).
+
+    Formatos tolerados:
+      'Juan Perez 15000' · 'JUAN PEREZ - $15.000'
+      'Brian David Munoz CUIT CUIL 44141951' -> doc, NO monto
+      'Ana Gomez DNI 30.111.222 $25.500'
     """
     if not texto:
-        return "", None
+        return "", None, ""
     limpio = " ".join(str(texto).split())
 
+    # 1) El documento sale primero y se saca del texto, para que no se
+    #    confunda con un importe (un DNI de 8 dígitos parece $44.141.951).
+    doc = ""
+    m = _RE_DOC_ETIQUETA.search(limpio) or _RE_CUIT.search(limpio)
+    if m:
+        doc = clave_doc(m.group(1))
+        limpio = limpio[: m.start()] + " " + limpio[m.end():]
+
+    # 2) Monto: primero lo que tenga $; si no, un número con decimales.
     monto = None
     con_signo = re.search(r"\$\s*([\d.,]+)", limpio)
     if con_signo:
         monto = parse_monto(con_signo.group(1))
-        limpio_sin = limpio.replace(con_signo.group(0), " ")
+        limpio = limpio.replace(con_signo.group(0), " ")
     else:
-        candidatos = [
-            (m, parse_monto(m.group(1))) for m in _RE_MONTO.finditer(limpio)
-        ]
-        candidatos = [(m, v) for m, v in candidatos if v is not None and v >= 100]
+        candidatos = []
+        for mm in _RE_MONTO.finditer(limpio):
+            crudo = mm.group(1)
+            solo_digitos = re.sub(r"\D", "", crudo)
+            tiene_decimales = bool(re.search(r"[.,]\d{1,2}$", crudo))
+            # Un entero de 7-8 dígitos sin decimales suele ser un DNI suelto
+            if not tiene_decimales and len(solo_digitos) in (7, 8, 11):
+                if not doc:
+                    doc = clave_doc(crudo)
+                    limpio = limpio[: mm.start()] + " " + limpio[mm.end():]
+                continue
+            v = parse_monto(crudo)
+            if v is not None and v >= 100:
+                candidatos.append((mm, v))
         if candidatos:
-            m, monto = candidatos[-1]          # el último número suele ser el monto
-            limpio_sin = limpio[: m.start()] + " " + limpio[m.end():]
-        else:
-            limpio_sin = limpio
+            mm, monto = candidatos[-1]
+            limpio = limpio[: mm.start()] + " " + limpio[mm.end():]
 
-    nombre = re.sub(r"(?i)\b(monto|importe|nombre|titular|total|pago|transferencia)\b[:\-]?", " ", limpio_sin)
+    # 3) Lo que queda, limpio de etiquetas, es el nombre
+    nombre = re.sub(r"(?i)\b(monto|importe|nombre|titular|total|pago|transferencia|"
+                    r"cuit|cuil|dni|documento|doc)\b[:\-]?", " ", limpio)
     nombre = re.sub(r"[\d$]+", " ", nombre)
     nombre = re.sub(r"[^\w\sÁÉÍÓÚÜÑáéíóúüñ]+", " ", nombre)
     nombre = " ".join(nombre.split())
-    return nombre.strip(), monto
+    return nombre.strip(), monto, doc
 
 
 # ----------------------------------------------------------------- fechas
