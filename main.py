@@ -37,6 +37,7 @@ from telethon.tl.types import Channel, User
 import analizador as an
 import config
 import excel as xl
+import nube
 import utils
 from storage import Storage
 
@@ -87,6 +88,7 @@ class Bot:
         )
         self.storage = Storage(config.HISTORIAL_FILE, config.VERIF_DIR)
         self.analizador = an.Analizador()
+        self.nube = nube.Cloudinary()
         self.sem_descarga = asyncio.Semaphore(config.CONCURRENCIA)
         self.lock_dup = asyncio.Lock()
         self.tareas: dict[int, asyncio.Task] = {}
@@ -240,6 +242,8 @@ class Bot:
             f"Cuenta: `{self.yo_id}` · modelo: `{self.analizador.modelo}`",
             f"Uptime: {horas}h {resto // 60}m · llamadas a Claude: {self.analizador.llamadas}",
             f"Volume: `{config.DATA_DIR}`",
+            (f"☁️ Cloudinary: {self.nube.subidas} subidas, {self.nube.fallos} fallos"
+             if self.nube.activo else "☁️ Cloudinary: desactivado"),
             "",
             f"📚 Historial: **{st['comprobantes']}** comprobantes · {st['imagenes']} imágenes",
             f"Última actualización: {st['actualizado'] or '—'}",
@@ -413,6 +417,7 @@ class Bot:
                 fecha_comp=datos["fecha"], hora_comp=datos.get("hora", ""),
                 confianza=datos["confianza"],
                 huella=utils.huella_comprobante(datos), reusado=True,
+                imagen_url=previo_msg.get("imagen_url") or "",
             )
             veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
             item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
@@ -477,6 +482,11 @@ class Bot:
             )
             estado["procesados"] += 1
             return item
+
+        if self.nube.activo:
+            url = await self.nube.subir(data, ctx["chat_id"], msg.id)
+            if url:
+                item["imagen_url"] = url
 
         datos = await self.analizador.leer_comprobante(data, "image/jpeg")
         item.update(
@@ -833,8 +843,14 @@ class Bot:
             await self.responder_largo(event, "\n".join(lineas))
             await event.respond(
                 file=str(ruta),
-                message="📎 Consolidado. La hoja **📋 Para cargar** trae los faltantes "
-                        "con las mismas columnas que tu planilla, listos para pegar.")
+                message="📎 Consolidado. La hoja **🧾 Cobertura** muestra el rango de IDs leídos; "
+                        "**📋 Para cargar**, los faltantes en formato de tu planilla.")
+            if res["solo_chat"]:
+                suelto = config.REPORTES_DIR / f"para_cargar_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                await asyncio.to_thread(xl.generar_planilla_agil, res["solo_chat"], suelto, semana)
+                await event.respond(
+                    file=str(suelto),
+                    message=f"📋 Solo los {len(res['solo_chat'])} faltantes, en formato Ágil.")
         except Exception as e:
             log.exception("Error en /faltantes")
             await event.respond(f"⚠️ No pude armar el consolidado: `{type(e).__name__}: {e}`")
