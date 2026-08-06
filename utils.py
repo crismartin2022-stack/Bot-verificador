@@ -15,6 +15,8 @@ STOPWORDS = {
     "comprobante", "envio", "enviado", "recibido", "sa", "srl",
     "cuota", "cuotas", "mes", "mensual", "semana", "efectivo", "deposito",
     "abono", "saldo", "resto", "total", "gracias", "ok", "listo", "hola",
+    "cuenta", "alias", "banco", "billetera", "titular", "destino", "origen",
+    "claro", "pay", "mercado", "pago", "nro", "numero", "operacion",
 }
 
 _RE_MONTO = re.compile(
@@ -190,6 +192,58 @@ def docs_iguales(a, b) -> bool:
 
 
 # ------------------------------------------------------------------ pie
+_RE_NOMBRE_PROPIO = re.compile(
+    r"\b([A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]{2,}(?:\s+[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]{2,}){1,3})\b"
+)
+# Sufijos societarios: donde aparecen, termina el nombre de la empresa y
+# suele empezar el de la persona.
+_RE_CORTE = re.compile(r"(?i)\b(s\.?r\.?l\.?|s\.?a\.?s?\.?|s\.?h\.?|ltda\.?|inc\.?)\b")
+
+
+def nombres_candidatos(texto: str, maximo: int = 25) -> list[str]:
+    """Saca los nombres propios de un pie que junta varias personas.
+
+    'Envío en k Tony Sasteup Srl Angel Maximiliano Cañete k Tony Sasteup Srl
+     Glady Uvaldina Sarco' -> ['Angel Maximiliano Cañete', 'Glady Uvaldina Sarco']
+    """
+    if not texto:
+        return []
+    vistos, salida = set(), []
+
+    def _agregar(cand: str):
+        # recorta el candidato en cuanto aparece una palabra que no es nombre
+        palabras = []
+        for p in str(cand).split():
+            if normalizar(p).lower() in STOPWORDS and palabras:
+                break
+            palabras.append(p)
+        cand = " ".join(palabras)
+        clave = normalizar(cand)
+        if not clave or clave in vistos or not tokens_nombre(cand):
+            return
+        vistos.add(clave)
+        salida.append(cand)
+
+    # Cortar por los sufijos societarios: el primer nombre de cada tramo
+    # es, casi siempre, la persona que pagó.
+    tramos = _RE_CORTE.split(str(texto))
+    for tramo in tramos:
+        if not tramo or _RE_CORTE.fullmatch(tramo.strip()):
+            continue
+        m = _RE_NOMBRE_PROPIO.search(tramo)
+        if m:
+            _agregar(m.group(1))
+        if len(salida) >= maximo:
+            return salida
+
+    # Y además todos los nombres propios sueltos, por las dudas
+    for m in _RE_NOMBRE_PROPIO.finditer(str(texto)):
+        _agregar(m.group(1))
+        if len(salida) >= maximo:
+            break
+    return salida
+
+
 def parse_pie(texto: str) -> tuple[str, float | None, str]:
     """Del pie de foto saca (nombre, monto, documento).
 
