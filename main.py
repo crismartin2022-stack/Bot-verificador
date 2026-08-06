@@ -4,6 +4,8 @@ Comandos (desde tu propia cuenta o desde un ADMIN_ID):
   /grupos [texto]                        lista los chats accesibles con su ID
   /verificar CHAT_ID [desde] [hasta]     verifica todo el historial (fechas dd/mm/aaaa)
   /reset CHAT_ID                         limpia la verificación (conserva el historial)
+  /reset CHAT_ID total                   además olvida ese chat del historial
+  /verificar CHAT_ID ... forzar          vuelve a leer con Claude, ignora lo cacheado
   /estado                                estado del bot y del historial
   /cancelar [CHAT_ID]                    corta una verificación en curso
   /ayuda                                 esta ayuda
@@ -209,13 +211,18 @@ class Bot:
         except ValueError:
             await event.respond("El CHAT_ID tiene que ser numérico (mirá `/grupos`).")
             return
+        total = any(p.lower() in ("total", "todo", "historial") for p in partes[1:])
         habia = await self.storage.resetear_verificacion(chat_id)
+        borrados = await self.storage.olvidar_chat(chat_id) if total else 0
         st = self.storage.stats_historial()
         await event.respond(
             (f"🧹 Verificación de `{chat_id}` reiniciada.\n" if habia
              else f"No había verificación guardada para `{chat_id}`.\n") +
-            f"📚 El historial se mantiene intacto: **{st['comprobantes']}** comprobantes registrados.\n"
-            f"Los reenvíos de comprobantes viejos se van a seguir detectando."
+            (f"🗑 Borradas **{borrados}** entradas del historial de ese chat: "
+             f"se van a releer con la API (tiene costo).\n" if total else
+             f"📚 El historial se mantiene intacto: **{st['comprobantes']}** comprobantes.\n"
+             f"Los reenvíos de comprobantes viejos se van a seguir detectando.\n"
+             f"Para releer todo desde cero: `/verificar {chat_id} forzar`")
         )
 
     async def cmd_estado(self, event):
@@ -257,9 +264,13 @@ class Bot:
                             else "No hay verificaciones en curso.")
 
     async def cmd_verificar(self, event, resto: str):
+        forzar = bool(re.search(r"(?i)\b(forzar|releer|completo)\b", resto))
+        resto = re.sub(r"(?i)\b(forzar|releer|completo)\b", " ", resto)
         partes = resto.split()
         if not partes:
-            await event.respond("Uso: `/verificar CHAT_ID [dd/mm/aaaa] [dd/mm/aaaa]`")
+            await event.respond(
+                "Uso: `/verificar CHAT_ID [dd/mm/aaaa] [dd/mm/aaaa]`\n"
+                "Agregá `forzar` al final para releer con Claude lo ya procesado.")
             return
         try:
             chat_id = int(partes[0])
@@ -279,7 +290,7 @@ class Bot:
             await event.respond("Fecha 'hasta' inválida. Formato: `dd/mm/aaaa`.")
             return
 
-        tarea = asyncio.create_task(self.verificar(event, chat_id, desde, hasta))
+        tarea = asyncio.create_task(self.verificar(event, chat_id, desde, hasta, forzar))
         self.tareas[chat_id] = tarea
 
     # ----------------------------------------------------------- verificación
@@ -357,7 +368,8 @@ class Bot:
                 await asyncio.sleep(2 * (intento + 1))
         return None
 
-    async def procesar(self, msg, pie: str, ctx: dict, estado: dict) -> dict:
+    async def procesar(self, msg, pie: str, ctx: dict, estado: dict,
+                       forzar: bool = False) -> dict:
         nombre_pie, monto_pie, doc_pie = utils.parse_pie(pie)
         remitente = ""
         try:
@@ -377,7 +389,7 @@ class Bot:
 
         # ¿Este mensaje exacto ya se leyó alguna vez? Se rehace el veredicto
         # con lo guardado: sin descarga y sin llamada a Claude.
-        previo_msg = self.storage.buscar_mensaje(ctx["chat_id"], msg.id)
+        previo_msg = None if forzar else self.storage.buscar_mensaje(ctx["chat_id"], msg.id)
         if previo_msg and previo_msg.get("monto") is not None:
             datos = {
                 "es_comprobante": True,
@@ -389,6 +401,7 @@ class Bot:
                 "banco": previo_msg.get("banco") or "",
                 "nro_operacion": previo_msg.get("nro_operacion") or "",
                 "fecha": previo_msg.get("fecha_comp") or "",
+                "hora": previo_msg.get("hora_comp") or "",
                 "confianza": previo_msg.get("confianza") if previo_msg.get("confianza") is not None else 1.0,
             }
             item.update(
@@ -397,7 +410,8 @@ class Bot:
                 cuit_origen=datos.get("cuit_origen", ""), cuit_destino=datos.get("cuit_destino", ""),
                 monto_img=datos["monto_num"],
                 banco=datos["banco"], nro_operacion=datos["nro_operacion"],
-                fecha_comp=datos["fecha"], confianza=datos["confianza"],
+                fecha_comp=datos["fecha"], hora_comp=datos.get("hora", ""),
+                confianza=datos["confianza"],
                 huella=utils.huella_comprobante(datos), reusado=True,
             )
             veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
@@ -419,10 +433,11 @@ class Bot:
         # ¿Ya procesado antes? No hace falta gastar otra llamada a Claude.
         async with self.lock_dup:
             previo = self.storage.buscar_previo(None, hash_img)
-        if previo:
+        if previo and not (forzar and previo.get("chat_id") == ctx["chat_id"]
+                           and previo.get("msg_id") == msg.id):
             mismo_mensaje = (previo.get("chat_id") == ctx["chat_id"]
                              and previo.get("msg_id") == msg.id)
-            if mismo_mensaje:
+            if mismo_mensaje and not forzar:
                 # Es LA MISMA publicación releída (p. ej. una corrida cortada):
                 # se rehace el veredicto con lo ya leído, sin pagar de nuevo.
                 datos = {
@@ -432,6 +447,7 @@ class Bot:
                     "banco": previo.get("banco") or "",
                     "nro_operacion": previo.get("nro_operacion") or "",
                     "fecha": previo.get("fecha_comp") or "",
+                "hora": previo.get("hora_comp") or "",
                     "confianza": previo.get("confianza") if previo.get("confianza") is not None else 1.0,
                 }
                 item.update(
@@ -440,7 +456,8 @@ class Bot:
                 cuit_origen=datos.get("cuit_origen", ""), cuit_destino=datos.get("cuit_destino", ""),
                 monto_img=datos["monto_num"],
                     banco=datos["banco"], nro_operacion=datos["nro_operacion"],
-                    fecha_comp=datos["fecha"], confianza=datos["confianza"],
+                    fecha_comp=datos["fecha"], hora_comp=datos.get("hora", ""),
+                confianza=datos["confianza"],
                     huella=utils.huella_comprobante(datos), reusado=True,
                 )
                 veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
@@ -473,13 +490,14 @@ class Bot:
             banco=datos.get("banco") or "",
             nro_operacion=datos.get("nro_operacion") or "",
             fecha_comp=datos.get("fecha") or "",
+            hora_comp=datos.get("hora") or "",
             confianza=datos.get("confianza"),
         )
         huella = utils.huella_comprobante(datos) if datos.get("es_comprobante") else None
         item["huella"] = huella
 
         async with self.lock_dup:
-            previo = self.storage.buscar_previo(huella, hash_img)
+            previo = None if ctx.get("forzar") else self.storage.buscar_previo(huella, hash_img)
             if previo:
                 item.update(
                     estado="duplicado",
@@ -489,7 +507,7 @@ class Bot:
                 )
                 estado["procesados"] += 1
                 return item
-            await self.storage.registrar(item)
+            await self.storage.registrar(item, actualizar=bool(ctx.get("forzar")))
 
         veredicto = an.comparar(datos, nombre_pie, monto_pie, doc_pie)
         item.update(estado=veredicto["estado"], detalle=veredicto["detalle"],
@@ -497,7 +515,7 @@ class Bot:
         estado["procesados"] += 1
         return item
 
-    async def verificar(self, event, chat_id: int, desde, hasta):
+    async def verificar(self, event, chat_id: int, desde, hasta, forzar: bool = False):
         estado = {"mensajes": 0, "detectados": 0, "procesados": 0, "reusados": 0}
         self.progreso[chat_id] = estado
         aviso = None
@@ -508,16 +526,21 @@ class Bot:
                 "chat_id": chat_id,
                 "chat": nombre_entidad(entidad),
                 "username": getattr(entidad, "username", None),
+                "forzar": forzar,
             }
             rango = (f"{desde.strftime('%d/%m/%Y')} → {hasta.strftime('%d/%m/%Y') if hasta else 'hoy'}"
                      if desde else "todo el historial")
-            aviso = await event.respond(f"🔎 Verificando **{ctx['chat']}**\nRango: {rango}\nLeyendo mensajes…")
+            aviso = await event.respond(
+                f"🔎 Verificando **{ctx['chat']}**\nRango: {rango}\n"
+                + ("♻️ Relectura forzada: se vuelve a consultar Claude (tiene costo)\n" if forzar else "")
+                + "Leyendo mensajes…")
 
             reporter = asyncio.create_task(self.reportar_progreso(aviso, estado, ctx["chat"]))
             try:
                 async for msg, pie in self.recolectar(entidad, chat_id, desde, hasta, estado):
                     estado["detectados"] += 1
-                    tareas.append(asyncio.create_task(self.procesar(msg, pie, ctx, estado)))
+                    tareas.append(asyncio.create_task(
+                        self.procesar(msg, pie, ctx, estado, forzar)))
                 items = list(await asyncio.gather(*tareas))
             finally:
                 reporter.cancel()
@@ -756,6 +779,7 @@ class Bot:
             return
 
         ids = [int(x) for x in re.findall(r"-?\d{6,}", resto)]
+        semana = re.sub(r"-?\d{6,}", " ", resto).strip()
         if not ids:
             ids = [v["chat_id"] for v in await self.storage.ultimas_verificaciones(100)]
         items, grupos = [], []
@@ -783,7 +807,7 @@ class Bot:
                 xl.generar_reporte, res,
                 {"chat": ", ".join(grupos), "chat_id": ids[0] if ids else "",
                  "archivo": " + ".join(a["nombre"] for a in ref["archivos"]),
-                 "grupos": grupos}, ruta,
+                 "grupos": grupos, "semana": semana}, ruta,
             )
             lineas = [
                 "📊 **Consolidado de faltantes**",
@@ -807,7 +831,10 @@ class Bot:
                     lineas.append(f"… y {len(res['solo_chat']) - 30} más en la planilla.")
             await aviso.delete()
             await self.responder_largo(event, "\n".join(lineas))
-            await event.respond(file=str(ruta), message="📎 Consolidado completo.")
+            await event.respond(
+                file=str(ruta),
+                message="📎 Consolidado. La hoja **📋 Para cargar** trae los faltantes "
+                        "con las mismas columnas que tu planilla, listos para pegar.")
         except Exception as e:
             log.exception("Error en /faltantes")
             await event.respond(f"⚠️ No pude armar el consolidado: `{type(e).__name__}: {e}`")
