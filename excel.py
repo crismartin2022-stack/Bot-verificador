@@ -19,6 +19,8 @@ CLAVES_NOMBRE = ("nombre", "apellido", "titular", "cliente", "beneficiario",
                  "destinatario", "socio", "alumno", "persona", "paciente")
 CLAVES_MONTO = ("monto", "importe", "valor", "pago", "total", "abono", "deposito", "depósito")
 CLAVES_FECHA = ("fecha", "dia", "día")
+CLAVES_DOC = ("cuit", "cuil", "dni", "documento", "doc")
+CLAVES_HORA = ("hora",)
 ENCABEZADOS_RUIDO = {"NOMBRE", "MONTO", "IMPORTE", "TITULAR", "CLIENTE", "FECHA", "TOTAL",
                      "APELLIDO", "NOMBRE Y APELLIDO", "BENEFICIARIO", "DESTINATARIO"}
 
@@ -34,10 +36,14 @@ def _detectar_columnas(hoja, max_filas: int = 15) -> tuple[int, dict]:
             t = utils.normalizar(val).lower()
             if not t:
                 continue
-            if "nombre" not in mapa and any(k in t for k in CLAVES_NOMBRE):
+            if "doc" not in mapa and any(k == t or t.startswith(k) for k in CLAVES_DOC):
+                mapa["doc"] = col
+            elif "nombre" not in mapa and any(k in t for k in CLAVES_NOMBRE):
                 mapa["nombre"] = col
             elif "monto" not in mapa and any(k in t for k in CLAVES_MONTO):
                 mapa["monto"] = col
+            elif "hora" not in mapa and any(k in t for k in CLAVES_HORA):
+                mapa["hora"] = col
             elif "fecha" not in mapa and any(k in t for k in CLAVES_FECHA):
                 mapa["fecha"] = col
         if "nombre" in mapa and "monto" in mapa:
@@ -96,12 +102,17 @@ def leer_excel(path: str | Path, hojas: list[str] | None = None) -> tuple[list[d
             fecha = celda("fecha")
             if isinstance(fecha, datetime):
                 fecha = fecha.date().isoformat()
+            hora = celda("hora")
+            if hasattr(hora, "strftime"):
+                hora = hora.strftime("%H:%M")
             filas.append({
                 "hoja": hoja.title,
                 "fila": i,
                 "nombre": nombre,
                 "monto": monto,
+                "doc": utils.clave_doc(celda("doc")),
                 "fecha": str(fecha) if fecha else "",
+                "hora": str(hora) if hora else "",
             })
 
         if len(filas) > n_antes:
@@ -124,8 +135,79 @@ def _datos_item(it: dict) -> tuple[str, float | None]:
     return nombre, monto
 
 
+def _perfil(it: dict) -> dict:
+    """Todos los datos comparables de un comprobante del chat.
+
+    Se reinterpreta el pie con la lógica actual, así los comprobantes
+    verificados con versiones viejas también aprovechan el DNI.
+    """
+    if it.get("_perfil"):
+        return it["_perfil"]
+
+    nombres = [it.get("nombre_img"), it.get("nombre_pie"),
+               it.get("nombre_origen"), it.get("nombre_destino")]
+    docs = [it.get("doc_pie"), it.get("cuit_origen"), it.get("cuit_destino"),
+            it.get("cvu_destino")]
+    montos = [it.get("monto_img"), it.get("monto_pie")]
+
+    pie = it.get("pie") or ""
+    if pie:
+        n_pie, m_pie, d_pie = utils.parse_pie(pie)
+        nombres.append(n_pie)
+        docs.append(d_pie)
+        montos.append(m_pie)
+
+    perfil = {
+        "nombres": [n for n in nombres if n and utils.tokens_nombre(n)],
+        "docs": {utils.clave_doc(d) for d in docs if utils.clave_doc(d)},
+        "montos": [m for m in montos if m is not None],
+        "fecha": (it.get("fecha_comp") or "")[:10],
+        "fecha_msg": it.get("fecha_msg") or "",
+    }
+    it["_perfil"] = perfil
+    return perfil
+
+
+def _fecha_item(perfil: dict) -> str:
+    """ISO yyyy-mm-dd de la operación, o del mensaje si no hay otra."""
+    if perfil["fecha"]:
+        return perfil["fecha"]
+    m = re.match(r"(\d{2})/(\d{2})/(\d{4})", perfil["fecha_msg"])
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else ""
+
+
+def _puntaje(perfil: dict, fila: dict) -> float:
+    """-1 = no aparea. Si aparea, cuanto más alto, mejor candidato."""
+    # 1) El monto es el ancla: tiene que coincidir con alguno de los del chat
+    if fila["monto"] is None or not perfil["montos"]:
+        return -1.0
+    if not any(utils.montos_iguales(m, fila["monto"], config.TOLERANCIA_MONTO)
+               for m in perfil["montos"]):
+        return -1.0
+
+    # 2) Documento o nombre
+    doc_fila = utils.clave_doc(fila.get("doc"))
+    doc_ok = bool(doc_fila) and any(utils.docs_iguales(d, doc_fila) for d in perfil["docs"])
+    sim = max([utils.similitud_nombres(n, fila["nombre"]) for n in perfil["nombres"]] or [0.0])
+
+    if not doc_ok and sim < config.UMBRAL_NOMBRE:
+        return -1.0
+
+    puntaje = 2.0 if doc_ok else 0.0
+    puntaje += sim
+
+    # 3) Fecha y hora: solo desempatan, nunca descartan
+    f_item = _fecha_item(perfil)
+    if f_item and fila.get("fecha") and f_item == str(fila["fecha"])[:10]:
+        puntaje += 0.5
+    return puntaje
+
+
 def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
-    """Clasifica en coinciden / duplicados / solo_chat / solo_excel."""
+    """Clasifica en coinciden / duplicados / solo_chat / solo_excel.
+
+    Aparea por monto + (documento o nombre). La fecha desempata.
+    """
     candidatos = [
         it for it in items_chat
         if it.get("estado") not in ("no_comprobante", "sin_pie")
@@ -155,28 +237,42 @@ def cruzar(items_chat: list[dict], filas_excel: list[dict]) -> dict:
                 vistos[k] = it
 
     disponibles = [it for it in candidatos if id(it) not in ids_dup]
-    usados: set[int] = set()
+    perfiles = [_perfil(it) for it in disponibles]
 
+    # Índice por monto: evita comparar cada fila contra todos los comprobantes
+    indice: dict[float, list[int]] = {}
+    for j, p in enumerate(perfiles):
+        for m in p["montos"]:
+            indice.setdefault(round(m, 2), []).append(j)
+
+    usados: set[int] = set()
     coinciden, solo_excel = [], []
+
     for fila in filas_excel:
-        mejor, mejor_sim = None, -1.0
-        for j, it in enumerate(disponibles):
-            if j in usados:
-                continue
-            nombre_it, monto_it = _datos_item(it)
-            if fila["monto"] is not None and monto_it is not None:
-                if not utils.montos_iguales(monto_it, fila["monto"], config.TOLERANCIA_MONTO):
+        mejor, mejor_p = None, 0.0
+        if fila["monto"] is not None:
+            cercanos = set(indice.get(round(fila["monto"], 2), []))
+            if config.TOLERANCIA_MONTO:
+                for m, js in indice.items():
+                    if abs(m - fila["monto"]) <= config.TOLERANCIA_MONTO:
+                        cercanos.update(js)
+            for j in cercanos:
+                if j in usados:
                     continue
-            sim = utils.similitud_nombres(nombre_it, fila["nombre"])
-            if sim >= config.UMBRAL_NOMBRE and sim > mejor_sim:
-                mejor, mejor_sim = j, sim
+                p = _puntaje(perfiles[j], fila)
+                if p > mejor_p:
+                    mejor, mejor_p = j, p
         if mejor is not None:
             usados.add(mejor)
-            coinciden.append({"excel": fila, "chat": disponibles[mejor], "similitud": mejor_sim})
+            coinciden.append({"excel": fila, "chat": disponibles[mejor],
+                              "similitud": min(mejor_p, 1.0) if mejor_p < 2 else 1.0,
+                              "por_doc": mejor_p >= 2.0})
         else:
             solo_excel.append(fila)
 
     solo_chat = [it for j, it in enumerate(disponibles) if j not in usados]
+    for it in disponibles:
+        it.pop("_perfil", None)
 
     return {
         "coinciden": coinciden,
