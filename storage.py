@@ -116,6 +116,7 @@ class Storage:
             "fecha_comp": item.get("fecha_comp"),
             "hora_comp": item.get("hora_comp"),
             "cvu_destino": item.get("cvu_destino"),
+            "imagen_url": item.get("imagen_url"),
             "confianza": item.get("confianza"),
             "nombre_origen": item.get("nombre_origen"),
             "nombre_destino": item.get("nombre_destino"),
