@@ -1,86 +1,82 @@
-"""Configuración central del bot verificador de comprobantes."""
+"""Subida de comprobantes a Cloudinary (opcional).
+
+Si no hay credenciales configuradas, no hace nada y el bot sigue igual.
+El public_id es determinístico (`<chat>_<msg>`), así una re-verificación
+sobrescribe la misma imagen en vez de duplicarla, y se puede compartir la
+cuenta con otro bot sin pisarse.
+"""
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from zoneinfo import ZoneInfo
+import asyncio
+import hashlib
+import logging
+import time
+
+import httpx
+
+import config
+
+log = logging.getLogger("nube")
 
 
-def _int(nombre: str, default: int) -> int:
-    try:
-        return int(os.environ.get(nombre, default))
-    except (TypeError, ValueError):
-        return default
+class Cloudinary:
+    def __init__(self):
+        self.cloud = config.CLOUDINARY_CLOUD_NAME
+        self.key = config.CLOUDINARY_API_KEY
+        self.secret = config.CLOUDINARY_API_SECRET
+        self.carpeta = config.CLOUDINARY_FOLDER
+        self.activo = bool(self.cloud and self.key and self.secret)
+        self.sem = asyncio.Semaphore(config.CONCURRENCIA)
+        self.subidas = 0
+        self.fallos = 0
+        self._cliente: httpx.AsyncClient | None = None
 
+    def _firma(self, params: dict) -> str:
+        base = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        return hashlib.sha1((base + self.secret).encode("utf-8")).hexdigest()
 
-def _float(nombre: str, default: float) -> float:
-    try:
-        return float(os.environ.get(nombre, default))
-    except (TypeError, ValueError):
-        return default
+    async def _http(self) -> httpx.AsyncClient:
+        if self._cliente is None:
+            self._cliente = httpx.AsyncClient(timeout=60)
+        return self._cliente
 
+    async def subir(self, data: bytes, chat_id, msg_id, nombre_archivo: str = "") -> str:
+        """Devuelve la URL segura, o '' si está desactivado o falló."""
+        if not self.activo or not data:
+            return ""
+        public_id = f"{str(chat_id).replace('-', 'n')}_{msg_id}"
+        params = {
+            "folder": self.carpeta,
+            "overwrite": "true",
+            "public_id": public_id,
+            "timestamp": str(int(time.time())),
+        }
+        datos = dict(params)
+        datos["api_key"] = self.key
+        datos["signature"] = self._firma(params)
 
-# --- Telegram (cuenta de usuario, Telethon) ---
-API_ID = _int("TELEGRAM_API_ID", 0)
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
-PHONE = os.environ.get("TELEGRAM_PHONE", "").strip()
-# String session generada con generar_session.py (NO subir al repo)
-SESSION_STRING = os.environ.get("TELEGRAM_SESSION", "").strip()
+        url = f"https://api.cloudinary.com/v1_1/{self.cloud}/image/upload"
+        for intento in range(3):
+            try:
+                async with self.sem:
+                    cli = await self._http()
+                    r = await cli.post(
+                        url, data=datos,
+                        files={"file": (nombre_archivo or f"{public_id}.jpg", data)},
+                    )
+                if r.status_code == 200:
+                    self.subidas += 1
+                    return r.json().get("secure_url", "")
+                log.warning("Cloudinary %s: %s", r.status_code, r.text[:200])
+                if r.status_code < 500:
+                    break
+            except Exception as e:
+                log.warning("Cloudinary error (%d): %s", intento + 1, e)
+            await asyncio.sleep(2 * (intento + 1))
+        self.fallos += 1
+        return ""
 
-# IDs de usuario autorizados a dar comandos, además de la propia cuenta.
-ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip("-").isdigit()
-}
-
-# --- Anthropic ---
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-# claude-sonnet-5 = mejor lectura de comprobantes.
-# claude-haiku-4-5-20251001 = más barato para volúmenes grandes.
-MODELO = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5").strip()
-MAX_TOKENS = _int("ANTHROPIC_MAX_TOKENS", 1200)
-
-# --- Cloudinary (opcional; se puede compartir con otro bot) ---
-CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
-CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "").strip()
-CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
-CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "comprobantes").strip()
-
-# --- Almacenamiento (Railway Volume montado en /data) ---
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-HISTORIAL_FILE = DATA_DIR / "historial.json"
-VERIF_DIR = DATA_DIR / "verificaciones"
-REPORTES_DIR = DATA_DIR / "reportes"
-LOG_FILE = DATA_DIR / "bot.log"
-
-# --- Parámetros de verificación ---
-TZ = ZoneInfo(os.environ.get("TZ_LOCAL", "America/Argentina/Buenos_Aires"))
-CONCURRENCIA = _int("MAX_CONCURRENCIA", 3)          # llamadas simultáneas a Claude
-UMBRAL_NOMBRE = _float("UMBRAL_NOMBRE", 0.80)       # 0-1, similitud mínima de nombres
-TOLERANCIA_MONTO = _float("TOLERANCIA_MONTO", 0.0)  # en pesos
-CONFIANZA_MIN = _float("CONFIANZA_MIN", 0.50)       # confianza mínima del OCR
-MAX_LADO_IMG = _int("MAX_LADO_IMG", 1568)           # px, redimensiona antes de enviar
-INTERVALO_PROGRESO = _int("INTERVALO_PROGRESO", 15)  # seg entre updates de progreso
-REINTENTOS_API = _int("REINTENTOS_API", 3)
-
-
-def validar() -> None:
-    """Falla temprano y claro si falta algo esencial."""
-    faltan = []
-    if not API_ID:
-        faltan.append("TELEGRAM_API_ID")
-    if not API_HASH:
-        faltan.append("TELEGRAM_API_HASH")
-    if not SESSION_STRING:
-        faltan.append("TELEGRAM_SESSION")
-    if not ANTHROPIC_API_KEY:
-        faltan.append("ANTHROPIC_API_KEY")
-    if faltan:
-        raise SystemExit(
-            "Faltan variables de entorno: " + ", ".join(faltan) +
-            "\nGenerá la sesión con: python generar_session.py"
-        )
-
-
-def preparar_directorios() -> None:
-    for d in (DATA_DIR, VERIF_DIR, REPORTES_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    async def cerrar(self):
+        if self._cliente is not None:
+            await self._cliente.aclose()
+            self._cliente = None
